@@ -10,6 +10,7 @@ from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult, \
     o3d_knn, params2rendervar, params2cpu, save_params
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
+from argparse import ArgumentParser
 
 
 def get_dataset(t, md, seq):
@@ -52,7 +53,8 @@ def initialize_params(seq, md):
     }
     params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
               params.items()}
-    cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  # Get scene radius
+    #here md[i][j] represents the ith timestep and jth camera.
+    cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  # Get all the cameras for the first timestep.
     scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
     variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'scene_radius': scene_radius,
@@ -97,8 +99,8 @@ def get_loss(params, curr_data, variables, is_initial_timestep):
         fg_pts = rendervar['means3D'][is_fg]
         fg_rot = rendervar['rotations'][is_fg]
 
-        rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"])
-        rot = build_rotation(rel_rot)
+        rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"]) #quaternion multiplication q_{t} * q_{t-1}^-1
+        rot = build_rotation(rel_rot) #build rotation from quaternion
         neighbor_pts = fg_pts[variables["neighbor_indices"]]
         curr_offset = neighbor_pts - fg_pts[:, None]
         curr_offset_in_prev_coord = (rot.transpose(2, 1)[:, None] @ curr_offset[:, :, :, None]).squeeze(-1)
@@ -138,7 +140,8 @@ def initialize_per_timestep(params, variables, optimizer):
     prev_inv_rot_fg = rot[is_fg]
     prev_inv_rot_fg[:, 1:] = -1 * prev_inv_rot_fg[:, 1:]
     fg_pts = pts[is_fg]
-    prev_offset = fg_pts[variables["neighbor_indices"]] - fg_pts[:, None]
+    #this prev offset calculates the distance between each point and its neighbor. 
+    prev_offset = fg_pts[variables["neighbor_indices"]] - fg_pts[:, None] #distance between each point and all of its neighbors
     variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach()
     variables['prev_offset'] = prev_offset.detach()
     variables["prev_col"] = params['rgb_colors'].detach()
@@ -156,9 +159,11 @@ def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
     init_fg_pts = params['means3D'][is_fg]
     init_bg_pts = params['means3D'][~is_fg]
     init_bg_rot = torch.nn.functional.normalize(params['unnorm_rotations'][~is_fg])
-    neighbor_sq_dist, neighbor_indices = o3d_knn(init_fg_pts.detach().cpu().numpy(), num_knn)
-    neighbor_weight = np.exp(-2000 * neighbor_sq_dist)
-    neighbor_dist = np.sqrt(neighbor_sq_dist)
+    #1. calculates the distances and weights for each gaussian and its neighbors.
+    neighbor_sq_dist, neighbor_indices = o3d_knn(init_fg_pts.detach().cpu().numpy(), num_knn) #excludes itself as neighbor
+    neighbor_weight = np.exp(-2000 * neighbor_sq_dist) #(N, num_knn)
+    neighbor_dist = np.sqrt(neighbor_sq_dist) #(N, num_knn)
+
     variables["neighbor_indices"] = torch.tensor(neighbor_indices).cuda().long().contiguous()
     variables["neighbor_weight"] = torch.tensor(neighbor_weight).cuda().float().contiguous()
     variables["neighbor_dist"] = torch.tensor(neighbor_dist).cuda().float().contiguous()
@@ -185,16 +190,30 @@ def report_progress(params, data, i, progress_bar, every_i=100):
 
 
 def train(seq, exp):
+    #TODO: write rendering results here 
     if os.path.exists(f"./output/{exp}/{seq}"):
         print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
         return
-    md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
-    num_timesteps = len(md['fn'])
+    if seq == "rose":
+        md = json.load(open(f"./plant_data/{seq}_multiview_small/transforms_train.json", 'r'))
+    else:
+        print(f"loading metadata for the {seq} scene")
+        md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
+
+    dataset_type = "Not specified"
+    if "fn" in md.keys():
+        dataset_type = "Panoptic CMU"
+        num_timesteps = len(md['fn'])
+
+    elif "camera_angle_x" in md.keys():
+        dataset_type = "Blender"
+        num_timesteps = 150 #TODO: maybe not hardcode this
+
     params, variables = initialize_params(seq, md)
     optimizer = initialize_optimizer(params, variables)
     output_params = []
-    for t in range(num_timesteps):
-        dataset = get_dataset(t, md, seq)
+    for t in range(num_timesteps): #training on timestep t
+        dataset = get_dataset(t, md, seq) #getting all cameras for time t
         todo_dataset = []
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
@@ -219,7 +238,11 @@ def train(seq, exp):
 
 
 if __name__ == "__main__":
-    exp_name = "exp1"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
-        train(sequence, exp_name)
-        torch.cuda.empty_cache()
+    parser = ArgumentParser(description="Training script parameters")
+    parser.add_argument("--scene", "-s", choices=["basketball", "boxes", "football", "juggle", "softball", "tennis", "rose"], default="basketball")
+    parser.add_argument("--name", "-n", type=str, default="exp1")
+    args = parser.parse_args()
+    sequence = args.scene
+    exp_name = args.name
+    train(sequence, exp_name)
+    torch.cuda.empty_cache()

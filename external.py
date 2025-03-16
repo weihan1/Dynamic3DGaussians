@@ -20,7 +20,10 @@ import torch
 import torch.nn.functional as func
 from torch.autograd import Variable
 from math import exp
-
+import numpy as np
+from plyfile import PlyData, PlyElement
+import os
+import matplotlib.pyplot as plt
 
 def build_rotation(q):
     norm = torch.sqrt(q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3])
@@ -210,4 +213,53 @@ def densify(params, variables, optimizer, i):
             new_params = {'logit_opacities': inverse_sigmoid(torch.ones_like(params['logit_opacities']) * 0.01)}
             params = update_params_and_optimizer(new_params, params, optimizer)
 
+    return params, variables
+
+def save_ply(points, output_filename):
+    """
+    Save 3D points to a PLY file.
+    """
+    points = points.detach().cpu().numpy()
+    # Create a structured numpy array for the vertices
+    vertices = np.zeros(points.shape[0], dtype=[
+        ('x', 'f4'), 
+        ('y', 'f4'), 
+        ('z', 'f4')
+    ])
+    
+    # Populate the vertices array
+    vertices['x'] = points[:, 0]
+    vertices['y'] = points[:, 1]
+    vertices['z'] = points[:, 2]
+    
+    # Create a PlyElement from the vertices
+    ply_element = PlyElement.describe(vertices, 'vertex')
+    
+    # Write the PLY file
+    PlyData([ply_element], text=True).write(output_filename)
+    
+    print(f"Saved {points.shape[0]} points to {output_filename}")
+    
+    
+def visualize_timestep(dataset, t, file_path):
+    """
+    Visualize all gt images for the given dataset.
+    """
+    for camera in dataset: 
+        ind = camera["id"]
+        extension = f"t{t}_{ind}.png" 
+        output_path = os.path.join(file_path, extension)
+        plt.imsave(output_path, camera["im"].permute(1,2,0).detach().cpu().numpy())
+    plt.close()
+    
+
+
+def load_from_checkpoint(checkpoint_path):
+    """
+    Loading parameters, variables, optimizer from checkpoint.
+    """
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    params = checkpoint["params"]
+    variables = checkpoint["variables"]
+    
     return params, variables
