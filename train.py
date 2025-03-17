@@ -1,3 +1,7 @@
+"""
+Use this script to reproduce the dynamic 3DGS baseline on our custom plant dataset.
+Notice for our dataset we do not
+"""
 import torch
 import os
 import json
@@ -6,73 +10,206 @@ import numpy as np
 from PIL import Image
 from random import randint
 from tqdm import tqdm
-from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from torch import Tensor
+from typing import Optional, Tuple, Dict
+
+# Use our own rasterizer for fair comparison
+# from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+from gsplat import rasterization
 from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult, \
     o3d_knn, params2rendervar, params2cpu, save_params
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 from argparse import ArgumentParser
+import imageio
+from helpers import knn
 
+"""
+TODO: Since i'm training last timestep on 27 cameras and middle timesteps on 9, modify the code to allow for that
+like allow for specific indexing of cameras
+"""
+def get_dataset(t, images, cam_to_worlds_dict, intrinsics, is_reverse=True, selected_cam_ids = ["r_1", "r_2", "r_3", "r_4", 
+                                                                                                "r_6", "r_7", "r_8", "r_9", "r_10"]):
+    """
+    Retrieve all cameras for timestep t.
+    If t != 0, only retrieve the cameras from selected_cam_ids. We want to simulate 27 cameras on last timestep and only 9 
+    otherwise.
+    """
+    # for c in range(len(md['fn'][t])):
+    #     w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
+    #     cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
+    #     fn = md['fn'][t][c]
+    #     im = np.array(copy.deepcopy(Image.open(f"./data/{seq}/ims/{fn}")))
+    #     im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
+    #     seg = np.array(copy.deepcopy(Image.open(f"./data/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)
+    #     seg = torch.tensor(seg).float().cuda()
+    #     seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
+    #     dataset.append({'cam': cam, 'im': im, 'seg': seg_col, 'id': c})
 
-def get_dataset(t, md, seq):
-    dataset = []
-    for c in range(len(md['fn'][t])):
-        w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
-        cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
-        fn = md['fn'][t][c]
-        im = np.array(copy.deepcopy(Image.open(f"./data/{seq}/ims/{fn}")))
-        im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
-        seg = np.array(copy.deepcopy(Image.open(f"./data/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)
-        seg = torch.tensor(seg).float().cuda()
-        seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
-        dataset.append({'cam': cam, 'im': im, 'seg': seg_col, 'id': c})
-    return dataset
+    data = {
+        "K": intrinsics,
+        "camtoworld": {},
+        "image": {},
+        "image_id": {}
+    }
+    
+    for camera_id, img_list in images.items():
+        if t == 0 or camera_id in selected_cam_ids:
+            data["camtoworld"][camera_id] = cam_to_worlds_dict[camera_id]
+            data["image"][camera_id] = torch.from_numpy(img_list[t]).float()
+            # data["image_id"][camera_id] = self.image_ids_dict[camera_id][timestep]
+    
+    return data
 
 
 def get_batch(todo_dataset, dataset):
+    """
+    Copies per-time dataset onto todo_dataset and randomly selects a camera from that timestep
+    """
     if not todo_dataset:
         todo_dataset = dataset.copy()
     curr_data = todo_dataset.pop(randint(0, len(todo_dataset) - 1))
     return curr_data
 
 
-def initialize_params(seq, md):
-    init_pt_cld = np.load(f"./data/{seq}/init_pt_cld.npz")["data"]
-    seg = init_pt_cld[:, 6]
-    max_cams = 50
-    sq_dist, _ = o3d_knn(init_pt_cld[:, :3], 3)
-    mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
+def initialize_params_and_get_data(data_dir, md, num_gaussians=100_000):
+    """
+    Use this when training on custom plant dataset.
+    It has "camera_angle_x" and "frames" as keys
+    """
+    cam_to_worlds_dict = {} #we just need on cam to worlds per view
+    images = {} #(N: T, H, W, C)
+    image_ids_dict = {} 
+    images_ids_lst = [] #only used for counting
+    progress_bar = tqdm(total=len(md["frames"]), desc=f"Loading the data from {data_dir}")
+    for frame in md["frames"]: 
+        image_ids = frame["file_path"].replace("./", "")
+        file_path = os.path.join(data_dir, image_ids)
+        camera_id = image_ids.split("/")[-2]
+        img = imageio.imread(file_path)
+        norm_img = img/255.0
+        norm_img[norm_img<0.1] = 0 #get rid of some background noise from blender scenes
+        norm_img = np.clip(norm_img, 0, 1) 
+        if camera_id not in images:
+            images[camera_id] = []
+            images[camera_id].append(norm_img)
+            image_ids_dict[camera_id] = []
+            image_ids_dict[camera_id].append(image_ids)
+        else:
+            images[camera_id].append(norm_img)
+            image_ids_dict[camera_id].append(image_ids)
+
+        c2w = torch.tensor(frame["transform_matrix"])
+        c2w[0:3, 1:3] *= -1  # Convert from OpenGL to OpenCV
+
+        cam_to_worlds_dict[camera_id] = c2w
+        progress_bar.update(1)
+        images_ids_lst.append(image_ids)
+
+    # Retrieve camera intrinsics
+    image_height, image_width = images[list(images.keys())[0]][0].shape[:2] #select the first image from first view cx = image_width / 2.0
+    cx = image_width / 2.0
+    cy = image_height / 2.0
+    fl = 0.5 * image_width / np.tan(0.5 * md["camera_angle_x"])
+    intrinsics = torch.tensor(
+        [[fl, 0, cx], [0, fl, cy], [0, 0, 1]], dtype=torch.float32
+    )
+
+    #All cameras
+    unique_cameras_lst = [v for _, v in cam_to_worlds_dict.items()]
+    camera_locations = np.stack(unique_cameras_lst, axis=0)[:, :3, 3]
+    scene_center = np.mean(camera_locations, axis=0)
+    dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+    trainset_scene_scale = np.max(dists)
+    global_scale = 1.0
+    scene_scale = trainset_scene_scale * 1.1 * global_scale
+    init_extent = 0.5
+    init_scale = 1.0
+    init_opacity = 0.1
+    
+    #initialize the parameters
+    points = init_extent * scene_scale * (torch.rand((num_gaussians, 3)) * 2 - 1)
+    print(f"points are initialized in [{points.min(), points.max()}]")
+    rgbs = torch.rand((num_gaussians, 3))
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist_avg = torch.sqrt(dist2_avg)
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    N = points.shape[0]
+    quats = torch.rand((N, 4))  # [N, 4]
+    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+
     params = {
-        'means3D': init_pt_cld[:, :3],
-        'rgb_colors': init_pt_cld[:, 3:6],
-        'seg_colors': np.stack((seg, np.zeros_like(seg), 1 - seg), -1),
-        'unnorm_rotations': np.tile([1, 0, 0, 0], (seg.shape[0], 1)),
-        'logit_opacities': np.zeros((seg.shape[0], 1)),
-        'log_scales': np.tile(np.log(np.sqrt(mean3_sq_dist))[..., None], (1, 3)),
-        'cam_m': np.zeros((max_cams, 3)),
-        'cam_c': np.zeros((max_cams, 3)),
+        'means3D': points,
+        'rgb_colors': rgbs,
+        'unnorm_rotations':  quats, 
+        'logit_opacities': opacities,
+        'log_scales': scales,
     }
-    params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
+
+    params = {k: torch.nn.Parameter(v.cuda().float().contiguous().requires_grad_(True)) for k, v in
               params.items()}
-    #here md[i][j] represents the ith timestep and jth camera.
-    cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  # Get all the cameras for the first timestep.
-    scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
+
     variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                 'scene_radius': scene_radius,
                  'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                 'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
-    return params, variables
+                 'denom': torch.zeros(params['means3D'].shape[0]).cuda().float(), 
+                 'scene_scale': scene_scale}
+
+    return params, variables, images, cam_to_worlds_dict, intrinsics
+
+
+    def rasterize_splats(
+        means: Tensor,
+        quats: Tensor,
+        scales: Tensor,
+        opacities: Tensor,
+        colors: Tensor,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        masks: Optional[Tensor] = None,
+        **kwargs,
+    ) -> Tuple[Tensor, Tensor, Dict]:
+        """
+        Rasterize the splats, if appeareance optimization is on, add the color contribution from the appearance 
+        module with the color of the splat.
+
+        Return 
+        -Rasterized image
+        -Rendered opacity mask 
+        -Additional rendering infos
+        """
+        #activate scales and opacities
+        scales = torch.exp(scales)  # [N, 3]
+        opacities = torch.sigmoid(opacities)  # [N,]
+        rasterize_mode = "classic"
+        render_colors, render_alphas, info = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+            Ks=Ks,  # [C, 3, 3]
+            width=width,
+            height=height,
+            packed=False,
+            absgrad=False,
+            sparse_grad=False,
+            rasterize_mode=rasterize_mode,
+            **kwargs,
+        )
+        if masks is not None:
+            render_colors[~masks] = 0
+        return render_colors, render_alphas, info
 
 
 def initialize_optimizer(params, variables):
     lrs = {
-        'means3D': 0.00016 * variables['scene_radius'],
+        'means3D': 0.00016 * variables["scene_scale"],
         'rgb_colors': 0.0025,
-        'seg_colors': 0.0,
         'unnorm_rotations': 0.001,
-        'logit_opacities': 0.05,
-        'log_scales': 0.001,
-        'cam_m': 1e-4,
-        'cam_c': 1e-4,
+        'logit_opacities': 0.05, 
+        'log_scales': 0.005 #changed from 0.001
     }
     param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
@@ -189,31 +326,21 @@ def report_progress(params, data, i, progress_bar, every_i=100):
         progress_bar.update(every_i)
 
 
-def train(seq, exp):
+def train(data_dir, exp):
+    """Training script for the rose scene, specifically tailored from my custom dataset."""
     #TODO: write rendering results here 
-    if os.path.exists(f"./output/{exp}/{seq}"):
-        print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
+    scene_name = data_dir.split("/")[-1]
+    if os.path.exists(f"./output/{exp}/{scene_name}"):
+        print(f"Experiment '{exp}' for scene '{scene_name}' already exists. Exiting.")
         return
-    if seq == "rose":
-        md = json.load(open(f"./plant_data/{seq}_multiview_small/transforms_train.json", 'r'))
-    else:
-        print(f"loading metadata for the {seq} scene")
-        md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
+    md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
+    num_timesteps = 150 
 
-    dataset_type = "Not specified"
-    if "fn" in md.keys():
-        dataset_type = "Panoptic CMU"
-        num_timesteps = len(md['fn'])
-
-    elif "camera_angle_x" in md.keys():
-        dataset_type = "Blender"
-        num_timesteps = 150 #TODO: maybe not hardcode this
-
-    params, variables = initialize_params(seq, md)
+    params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md)
     optimizer = initialize_optimizer(params, variables)
     output_params = []
     for t in range(num_timesteps): #training on timestep t
-        dataset = get_dataset(t, md, seq) #getting all cameras for time t
+        dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
         todo_dataset = []
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
@@ -239,10 +366,10 @@ def train(seq, exp):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--scene", "-s", choices=["basketball", "boxes", "football", "juggle", "softball", "tennis", "rose"], default="basketball")
+    parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose_mini")
     parser.add_argument("--name", "-n", type=str, default="exp1")
     args = parser.parse_args()
-    sequence = args.scene
+    data_dir = args.data_dir
     exp_name = args.name
-    train(sequence, exp_name)
+    train(data_dir, exp_name)
     torch.cuda.empty_cache()
