@@ -32,7 +32,7 @@ TODO: Since i'm training last timestep on 27 cameras and middle timesteps on 9, 
 like allow for specific indexing of cameras
 """
 def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids = ["r_1", "r_2", "r_3", "r_4", 
-                                                                                                "r_6", "r_7", "r_8", "r_9", "r_10"]):
+                                                                                "r_6", "r_7", "r_8", "r_9", "r_10"]):
     """
     Retrieve all cameras for timestep t.
     If t != 0, only retrieve the cameras from selected_cam_ids. We want to simulate 27 cameras on last timestep and only 9 
@@ -50,7 +50,7 @@ def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids = ["
     for camera_id, img_list in images.items():
         if t == 0 or camera_id in selected_cam_ids:
             data["camtoworld"][camera_id] = cam_to_worlds_dict[camera_id]
-            data["image"][camera_id] = torch.from_numpy(img_list[t]).float()
+            data["image"][camera_id] = torch.from_numpy(img_list[t]).float() #retrieves 
             # data["image_id"][camera_id] = self.image_ids_dict[camera_id][timestep]
     data["width"] = width
     data["height"] = height 
@@ -402,6 +402,8 @@ def report_progress(params, variables, dataset, i, progress_bar, cam_ind=0, ever
 def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
     """
     Render a canvas with pred and gt images.
+    Given dataset, render images from all possible views of this dataset.
+    TODO: This code is wrong lol
     """
     curr_data = {"Ks": dataset["K"].unsqueeze(0).to("cuda"),
                  "width": dataset["width"],
@@ -454,7 +456,7 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
         canvas = torch.cat(canvas_list, dim=1).squeeze(0).cpu().numpy()
         canvas = (canvas * 255).astype(np.uint8)
         imageio.imwrite(
-            f"{exp_path}/t_{timestep}_iter_{iteration}.png",
+            f"{exp_path}/t_{timestep}_iter_{iteration}_{camera_indx}.png",
             canvas,
         )
 
@@ -500,12 +502,13 @@ def train(data_dir, exp, every_t):
     exp_path = f"./output/{exp}/{scene_name}_{now}"
     os.makedirs(exp_path, exist_ok=True)
     md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
-    plot_intervals = [1, 2999, 6999, 9999] 
+    plot_intervals = [1, 599, 1999, 6999, 9999] 
     strategy = DefaultStrategy()
     strategy.refine_stop_iter = 5000 #original code base only prunes before iteration 5000
     params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
-    timesteps = list(range(0, len(images)))
+    timesteps = list(range(0, len(images["r_1"]))) #assuming all cameras have the same number of timesteps
     num_timesteps = len(timesteps)
+    print(f"training our method on {num_timesteps} timesteps")
     optimizer = initialize_optimizer(params, variables)
 
     # Do the strategy stuff here
@@ -517,7 +520,7 @@ def train(data_dir, exp, every_t):
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 10_000 if is_initial_timestep else 2000
+        num_iter_per_timestep = 5 if is_initial_timestep else 5 
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
