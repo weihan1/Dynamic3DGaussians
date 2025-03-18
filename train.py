@@ -27,10 +27,6 @@ from argparse import ArgumentParser
 import imageio.v2 as imageio
 from helpers import knn
 
-"""
-TODO: Since i'm training last timestep on 27 cameras and middle timesteps on 9, modify the code to allow for that
-like allow for specific indexing of cameras
-"""
 def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids = ["r_1", "r_2", "r_3", "r_4", 
                                                                                 "r_6", "r_7", "r_8", "r_9", "r_10"]):
     """
@@ -517,6 +513,8 @@ def train(data_dir, exp, every_t):
     output_params = [] #contain the gaussians params for each timestep.
     for t in timesteps: #training on timestep t
         dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
+        num_cams = len(dataset["image"])
+        print(f"start training on time {t} with {num_cams} cameras")
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
@@ -547,9 +545,11 @@ def train(data_dir, exp, every_t):
     save_params(output_params, exp_path)
 
 
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose_mini")
+    parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose")
     parser.add_argument("--name", "-n", type=str, default="exp1")
     parser.add_argument("--every_t", "-t", type=int, default=10)
     args = parser.parse_args()
