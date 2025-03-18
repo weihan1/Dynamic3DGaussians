@@ -45,11 +45,42 @@ def build_rotation(q):
     return rot
 
 
+def mse(img1, img2):
+    return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
+
+@torch.no_grad()
+def calc_psnr(img1, img2, mask=None):
+    """
+    Calculate PSNR between two images, optionally using a mask
+    Args:
+        img1, img2: Tensors of shape (-1,h,w,3) in range [0,1]
+        mask: Optional binary mask of shape (-1,h,w)
+    Returns:
+        PSNR value as tensor
+    """
+    if mask is not None:
+        # Expand mask to match img shape and apply
+        mask = mask.unsqueeze(-1).expand_as(img1)
+        img1_masked = img1[mask].reshape(-1, 3)
+        img2_masked = img2[mask].reshape(-1, 3)
+        _mse = ((img1_masked - img2_masked) ** 2).mean()
+    else:
+        _mse = ((img1 - img2) ** 2).mean()
+    
+    # Handle the case where images are identical
+    if _mse == 0:
+        return torch.tensor(float('inf'))
+        
+    # Assuming images are in [0,1] range
+    psnr = 20 * torch.log10(1.0 / torch.sqrt(_mse))
+    
+    return psnr
+
 def calc_mse(img1, img2):
     return ((img1 - img2) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
 
 
-def calc_psnr(img1, img2):
+def calc_psnr_old(img1, img2):
     mse = ((img1 - img2) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
@@ -166,6 +197,10 @@ def inverse_sigmoid(x):
 
 
 def densify(params, variables, optimizer, i):
+    """
+    For iteration less than 5000, every 100 iterations starting from 500 prune and split.
+    Every 3000 iterations prune based on opacities.
+    """
     if i <= 5000:
         variables = accumulate_mean2d_gradient(variables)
         grad_thresh = 0.0002

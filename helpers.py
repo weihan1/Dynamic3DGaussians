@@ -2,36 +2,43 @@ import torch
 import os
 import open3d as o3d
 import numpy as np
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
+# from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
 from typing import NamedTuple
 from plyfile import PlyData, PlyElement
 import math
 from sklearn.neighbors import NearestNeighbors
 
-def setup_camera(w, h, k, w2c, near=0.01, far=100):
-    fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-    w2c = torch.tensor(w2c).cuda().float()
-    cam_center = torch.inverse(w2c)[:3, 3]
-    w2c = w2c.unsqueeze(0).transpose(1, 2)
-    opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
-                                [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
-                                [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
-                                [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
-    full_proj = w2c.bmm(opengl_proj)
-    cam = Camera(
-        image_height=h,
-        image_width=w,
-        tanfovx=w / (2 * fx),
-        tanfovy=h / (2 * fy),
-        bg=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"),
-        scale_modifier=1.0,
-        viewmatrix=w2c,
-        projmatrix=full_proj,
-        sh_degree=0,
-        campos=cam_center,
-        prefiltered=False
-    )
-    return cam
+
+"""
+TODO: first use the gsplat rasterizer, and if it works, don't need to use the inria rasterizer.
+"""
+
+
+
+# def setup_camera(w, h, k, w2c, near=0.01, far=100):
+#     fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
+#     w2c = torch.tensor(w2c).cuda().float()
+#     cam_center = torch.inverse(w2c)[:3, 3]
+#     w2c = w2c.unsqueeze(0).transpose(1, 2)
+#     opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
+#                                 [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
+#                                 [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
+#                                 [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
+#     full_proj = w2c.bmm(opengl_proj)
+#     cam = Camera(
+#         image_height=h,
+#         image_width=w,
+#         tanfovx=w / (2 * fx),
+#         tanfovy=h / (2 * fy),
+#         bg=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"),
+#         scale_modifier=1.0,
+#         viewmatrix=w2c,
+#         projmatrix=full_proj,
+#         sh_degree=0,
+#         campos=cam_center,
+#         prefiltered=False
+#     )
+#     return cam
 
 def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.zeros((4, 4))
@@ -114,13 +121,15 @@ def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
 
 def params2rendervar(params):
+    """
+    Activate the parameters. Quaternions do not need to be normalized.
+    """
     rendervar = {
-        'means3D': params['means3D'],
-        'colors_precomp': params['rgb_colors'],
-        'rotations': torch.nn.functional.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
-        'scales': torch.exp(params['log_scales']),
-        'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
+        'means': params['means'],
+        'colors': params['rgbs'],
+        'quats': params['quats'],
+        'opacities': torch.sigmoid(params['opacities']),
+        'scales': torch.exp(params['scales']),
     }
     return rendervar
 
@@ -181,15 +190,15 @@ def params2cpu(params, is_initial_timestep):
     return res
 
 
-def save_params(output_params, seq, exp):
+def save_params(output_params, scene_name, exp):
     to_save = {}
     for k in output_params[0].keys():
         if k in output_params[1].keys():
             to_save[k] = np.stack([params[k] for params in output_params])
         else:
             to_save[k] = output_params[0][k]
-    os.makedirs(f"./output/{exp}/{seq}", exist_ok=True)
-    np.savez(f"./output/{exp}/{seq}/params", **to_save)
+    os.makedirs(f"./output/{exp}/{scene_name}", exist_ok=True)
+    np.savez(f"./output/{exp}/{scene_name}/params", **to_save)
 
 class BasicPointCloud(NamedTuple):
     points : np.array
@@ -207,3 +216,6 @@ def fetchPly(path):
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals, seg_colors=None)
+    
+    
+    
