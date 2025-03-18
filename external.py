@@ -139,17 +139,21 @@ def accumulate_mean2d_gradient(variables):
 
 
 def update_params_and_optimizer(new_params, params, optimizer):
-    for k, v in new_params.items():
-        group = [x for x in optimizer.param_groups if x["name"] == k][0]
-        stored_state = optimizer.state.get(group['params'][0], None)
-
+    """
+    Reset the first and second moving averages of adam for the new parameters.
+    But keep the step for these new parameters.
+    """
+    for k,v in new_params.items():
+        stored_state = optimizer[k].state.get(optimizer[k].param_groups[0]['params'][0], None)
         stored_state["exp_avg"] = torch.zeros_like(v)
         stored_state["exp_avg_sq"] = torch.zeros_like(v)
-        del optimizer.state[group['params'][0]]
+        del optimizer[k].state[optimizer[k].param_groups[0]['params'][0]]
 
-        group["params"][0] = torch.nn.Parameter(v.requires_grad_(True))
-        optimizer.state[group['params'][0]] = stored_state
-        params[k] = group["params"][0]
+        #Re-update the optimizer, moving averages, and param dict
+        new_param = torch.nn.Parameter(v.requires_grad_(True))
+        optimizer[k].param_groups[0]["params"][0] = new_param
+        optimizer[k].state[optimizer[k].param_groups[0]['params'][0]] = stored_state
+        params[k] = new_param
     return params
 
 

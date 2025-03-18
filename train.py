@@ -271,9 +271,9 @@ def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strat
     losses['im'] = 0.8 * l1_loss_v1(im, pixels) + 0.2 * (1.0 - calc_ssim(im, pixels))
 
     if not is_initial_timestep:
-        is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
-        fg_pts = rendervar['means3D'][is_fg]
-        fg_rot = rendervar['rotations'][is_fg]
+        # is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
+        fg_pts = rendervar['means']
+        fg_rot = rendervar['quats']
 
         rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"]) #quaternion multiplication q_{t} * q_{t-1}^-1
         rot = build_rotation(rel_rot) #build rotation from quaternion
@@ -289,13 +289,14 @@ def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strat
         curr_offset_mag = torch.sqrt((curr_offset ** 2).sum(-1) + 1e-20)
         losses['iso'] = weighted_l2_loss_v1(curr_offset_mag, variables["neighbor_dist"], variables["neighbor_weight"])
 
-        losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
+        #TODO: enable these losses after, first use rigid, rot and iso
+        # losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
 
-        bg_pts = rendervar['means3D'][~is_fg]
-        bg_rot = rendervar['rotations'][~is_fg]
-        losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
+        # bg_pts = rendervar['means3D'][~is_fg]
+        # bg_rot = rendervar['rotations'][~is_fg]
+        # losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
 
-        losses['soft_col_cons'] = l1_loss_v2(params['rgb_colors'], variables["prev_col"])
+        # losses['soft_col_cons'] = l1_loss_v2(params['rgbs'], variables["prev_col"])
 
     loss_weights = {'im': 1.0, 'seg': 3.0, 'rigid': 4.0, 'rot': 4.0, 'iso': 2.0, 'floor': 2.0, 'bg': 20.0,
                     'soft_col_cons': 0.01}
@@ -305,34 +306,37 @@ def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strat
 
 
 def initialize_per_timestep(params, variables, optimizer):
-    pts = params['means3D']
-    rot = torch.nn.functional.normalize(params['unnorm_rotations'])
+    pts = params['means']
+    #  forward estimate based on a velocity 
+    rot = torch.nn.functional.normalize(params['quats'])
     new_pts = pts + (pts - variables["prev_pts"])
     new_rot = torch.nn.functional.normalize(rot + (rot - variables["prev_rot"]))
 
-    is_fg = params['seg_colors'][:, 0] > 0.5
-    prev_inv_rot_fg = rot[is_fg]
+    # is_fg = params['seg_colors'][:, 0] > 0.5
+    prev_inv_rot_fg = rot
     prev_inv_rot_fg[:, 1:] = -1 * prev_inv_rot_fg[:, 1:]
-    fg_pts = pts[is_fg]
+    fg_pts = pts
     #this prev offset calculates the distance between each point and its neighbor. 
     prev_offset = fg_pts[variables["neighbor_indices"]] - fg_pts[:, None] #distance between each point and all of its neighbors
     variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach()
     variables['prev_offset'] = prev_offset.detach()
-    variables["prev_col"] = params['rgb_colors'].detach()
+    variables["prev_col"] = params['rgbs'].detach()
     variables["prev_pts"] = pts.detach()
     variables["prev_rot"] = rot.detach()
 
-    new_params = {'means3D': new_pts, 'unnorm_rotations': new_rot}
+    new_params = {'means': new_pts, 'quats': new_rot}
     params = update_params_and_optimizer(new_params, params, optimizer)
 
     return params, variables
 
 
 def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
-    is_fg = params['seg_colors'][:, 0] > 0.5
-    init_fg_pts = params['means3D'][is_fg]
-    init_bg_pts = params['means3D'][~is_fg]
-    init_bg_rot = torch.nn.functional.normalize(params['unnorm_rotations'][~is_fg])
+    """Calculating the neighbors of each gaussians means and freezing opacities and scales"""
+    # is_fg = params['seg_colors'][:, 0] > 0.5
+    # init_fg_pts = params['means3D'][is_fg]
+    # init_bg_pts = params['means3D'][~is_fg]
+    # init_bg_rot = torch.nn.functional.normalize(params['unnorm_rotations'][~is_fg])
+    init_fg_pts = params["means"]
     #1. calculates the distances and weights for each gaussian and its neighbors.
     neighbor_sq_dist, neighbor_indices = o3d_knn(init_fg_pts.detach().cpu().numpy(), num_knn) #excludes itself as neighbor
     neighbor_weight = np.exp(-2000 * neighbor_sq_dist) #(N, num_knn)
@@ -342,14 +346,14 @@ def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
     variables["neighbor_weight"] = torch.tensor(neighbor_weight).cuda().float().contiguous()
     variables["neighbor_dist"] = torch.tensor(neighbor_dist).cuda().float().contiguous()
 
-    variables["init_bg_pts"] = init_bg_pts.detach()
-    variables["init_bg_rot"] = init_bg_rot.detach()
-    variables["prev_pts"] = params['means3D'].detach()
-    variables["prev_rot"] = torch.nn.functional.normalize(params['unnorm_rotations']).detach()
-    params_to_fix = ['logit_opacities', 'log_scales', 'cam_m', 'cam_c']
-    for param_group in optimizer.param_groups:
-        if param_group["name"] in params_to_fix:
-            param_group['lr'] = 0.0
+    # variables["init_bg_pts"] = init_bg_pts.detach()
+    # variables["init_bg_rot"] = init_bg_rot.detach()
+    variables["prev_pts"] = params["means"].detach()
+    variables["prev_rot"] = torch.nn.functional.normalize(params["quats"]).detach()
+    params_to_fix = ['opacities', 'scales']
+    for param_name, opt_class in optimizer.items():
+        if param_name in params_to_fix:
+            opt_class.param_groups[0]["lr"] = 0.0
     return variables
 
 
@@ -390,7 +394,8 @@ def report_progress(params, variables, dataset, i, progress_bar, cam_ind=0, ever
         pred_image = torch.clamp(pred_image, 0, 1).squeeze()
         gt_image = torch.clamp(pixels, 0, 1).squeeze() 
         psnr = calc_psnr(pred_image, gt_image, mask)
-        progress_bar.set_postfix({f"train img {cam_ind} mask PSNR": f"{psnr:.{2}f}"})
+        progress_bar.set_postfix({f"train img {cam_ind} mask PSNR": f"{psnr:.{2}f}",
+                                  "num_gauss": means.shape[0]})
         progress_bar.update(every_i)
 
 @torch.no_grad()
@@ -477,7 +482,7 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
             "num_GS": params["means"].shape[0],
         }
     )
-    print(f"PSNR: {stats['psnr']:.3f}")
+    print(f"The PSNR at time {timestep}, iteration {iteration}: {stats['psnr']:.3f}")
     # print(
     #     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
     #     f"Number of GS: {stats['num_GS']}"
@@ -496,23 +501,23 @@ def train(data_dir, exp, every_t):
     os.makedirs(exp_path, exist_ok=True)
     md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
     plot_intervals = [1, 2999, 6999, 9999] 
-    all_train_steps = list(range(0, 150, every_t))
-    num_timesteps = len(all_train_steps)
     strategy = DefaultStrategy()
     strategy.refine_stop_iter = 5000 #original code base only prunes before iteration 5000
     params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
+    timesteps = list(range(0, len(images)))
+    num_timesteps = len(timesteps)
     optimizer = initialize_optimizer(params, variables)
 
     # Do the strategy stuff here
     strategy.check_sanity(params, optimizer)
     strategy_state = strategy.initialize_state() #initializes running state
-    output_params = []
-    for t in all_train_steps: #training on timestep t
-        dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics, num_timesteps) #getting all cameras for time t
+    output_params = [] #contain the gaussians params for each timestep.
+    for t in timesteps: #training on timestep t
+        dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 10000 if is_initial_timestep else 2000
+        num_iter_per_timestep = 10_000 if is_initial_timestep else 2000
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
@@ -522,10 +527,6 @@ def train(data_dir, exp, every_t):
                 strategy.step_post_backward(params, optimizer, strategy_state, i, info) #growing and pruning
             with torch.no_grad():
                 report_progress(params, variables, dataset, i, progress_bar)
-                # For iteration less than 5000, every 100 iterations starting from 500 prune and split.
-                # Every 3000 iterations prune based on opacities.
-                # if is_initial_timestep:
-                    # params, variables = densify(params, variables, optimizer, i)
                 for opt in optimizer.values():
                     opt.step()
                     opt.zero_grad(set_to_none=True)
@@ -540,14 +541,14 @@ def train(data_dir, exp, every_t):
 
     #TODO: Need to write the NVS eval
     # render_eval
-    save_params(output_params, scene_name, exp)
+    save_params(output_params, exp_path)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose_mini")
     parser.add_argument("--name", "-n", type=str, default="exp1")
-    parser.add_argument("--every_t", "-s", type=int, default=10)
+    parser.add_argument("--every_t", "-t", type=int, default=10)
     args = parser.parse_args()
     data_dir = args.data_dir
     exp_name = args.name

@@ -182,23 +182,27 @@ def knn(x, K= 4):
     return torch.from_numpy(distances).to(x)
 
 def params2cpu(params, is_initial_timestep):
-    if is_initial_timestep:
-        res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items()}
-    else:
-        res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items() if
-               k in ['means3D', 'rgb_colors', 'unnorm_rotations']}
+    """Detach all params and set to numpy"""
+    # if is_initial_timestep:
+    #     res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items()}
+    # else:
+    #     #THe reason you're saving only means, rgbs, and quats is because scales and opacities are frozen
+    #     res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items() if
+    #            k in ['means', 'rgbs', 'quats']}
+
+    #TODO: for now, let's just save everything to make sure there's no mistakes in the code.
+    res = {k: v.detach().cpu().contiguous().numpy() for k, v in params.items()}
     return res
 
 
-def save_params(output_params, scene_name, exp):
+def save_params(output_params, exp_path):
     to_save = {}
     for k in output_params[0].keys():
         if k in output_params[1].keys():
             to_save[k] = np.stack([params[k] for params in output_params])
         else:
             to_save[k] = output_params[0][k]
-    os.makedirs(f"./output/{exp}/{scene_name}", exist_ok=True)
-    np.savez(f"./output/{exp}/{scene_name}/params", **to_save)
+    np.savez(f"{exp_path}/params", **to_save)
 
 class BasicPointCloud(NamedTuple):
     points : np.array
