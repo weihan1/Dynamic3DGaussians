@@ -399,7 +399,7 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
     """
     Render a canvas with pred and gt images.
     Given dataset, render images from all possible views of this dataset.
-    TODO: This code is wrong lol
+    Compute average masked PSNR over all training cameras across all views.
     """
     curr_data = {"Ks": dataset["K"].unsqueeze(0).to("cuda"),
                  "width": dataset["width"],
@@ -492,7 +492,6 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
 
 def train(data_dir, exp, every_t):
     """Training script for the rose scene, specifically tailored from my custom dataset."""
-    #TODO: write rendering results here 
     scene_name = data_dir.split("/")[-1]
     now = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
     exp_path = f"./output/{exp}/{scene_name}_{now}"
@@ -514,11 +513,13 @@ def train(data_dir, exp, every_t):
     for t in timesteps: #training on timestep t
         dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
         num_cams = len(dataset["image"])
-        print(f"start training on time {t} with {num_cams} cameras")
+        cam_ind = list(dataset["image"])
+        print(f"start training on time {t} with {num_cams} cameras \n")
+        print(f"the camera indices are {cam_ind}")
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 5 if is_initial_timestep else 5 
+        num_iter_per_timestep = 10_000 if is_initial_timestep else 2000
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
@@ -542,6 +543,10 @@ def train(data_dir, exp, every_t):
 
     #TODO: Need to write the NVS eval
     # render_eval
+    with open(f"{exp_path}/cfg.txt", "w") as f:
+        f.write(f"data_dir: {data_dir}\n")      # Write data_dir with a newline
+        f.write(f"every_t: {every_t}\n")        # Write every_t with a newline
+        
     save_params(output_params, exp_path)
 
 
@@ -549,7 +554,7 @@ def train(data_dir, exp, every_t):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose")
+    parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose_mini")
     parser.add_argument("--name", "-n", type=str, default="exp1")
     parser.add_argument("--every_t", "-t", type=int, default=10)
     args = parser.parse_args()
