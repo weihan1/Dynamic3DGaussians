@@ -16,6 +16,7 @@ from torch import Tensor
 from typing import Optional, Tuple, Dict
 from collections import defaultdict
 from datetime import datetime
+from glob import glob
 
 # Use our own rasterizer for fair comparison
 # from diff_gaussian_rasterization import GaussianRasterizer as Renderer
@@ -27,8 +28,7 @@ from argparse import ArgumentParser
 import imageio.v2 as imageio
 from helpers import knn
 
-def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids = ["r_1", "r_2", "r_3", "r_4", 
-                                                                                "r_6", "r_7", "r_8", "r_9", "r_10"]):
+def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids=None):
     """
     Retrieve all cameras for timestep t.
     If t != 0, only retrieve the cameras from selected_cam_ids. We want to simulate 27 cameras on last timestep and only 9 
@@ -44,9 +44,9 @@ def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids = ["
     height, width = images[all_camera_indices[0]][0].shape[0], images[all_camera_indices[0]][0].shape[1]
     
     for camera_id, img_list in images.items():
-        if t == 0 or camera_id in selected_cam_ids:
-            data["camtoworld"][camera_id] = cam_to_worlds_dict[camera_id]
-            data["image"][camera_id] = torch.from_numpy(img_list[t]).float() #retrieves 
+        # if t == 0 or camera_id in selected_cam_ids:
+        data["camtoworld"][camera_id] = cam_to_worlds_dict[camera_id]
+        data["image"][camera_id] = torch.from_numpy(img_list[t]).float() #retrieves 
             # data["image_id"][camera_id] = self.image_ids_dict[camera_id][timestep]
     data["width"] = width
     data["height"] = height 
@@ -488,7 +488,8 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
     # save stats as json
     with open(f"{exp_path}/timestep_{timestep}_iter_{iteration}.json", "w") as f:
         json.dump(stats, f)
-    
+
+
 
 def train(data_dir, exp, every_t):
     """Training script for the rose scene, specifically tailored from my custom dataset."""
@@ -519,7 +520,7 @@ def train(data_dir, exp, every_t):
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 10_000 if is_initial_timestep else 2000
+        num_iter_per_timestep = 30_000 if is_initial_timestep else 2000
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
@@ -534,27 +535,29 @@ def train(data_dir, exp, every_t):
                     opt.zero_grad(set_to_none=True)
 
             if i in plot_intervals: 
-                render_imgs(dataset, params, variables, exp_path, t, i)       
+                # render_imgs(dataset, params, variables, exp_path, t, i)       
+                continue
 
         progress_bar.close()
         output_params.append(params2cpu(params, is_initial_timestep))
         if is_initial_timestep:
             variables = initialize_post_first_timestep(params, variables, optimizer)
 
-    #TODO: Need to write the NVS eval
-    # render_eval
     with open(f"{exp_path}/cfg.txt", "w") as f:
         f.write(f"data_dir: {data_dir}\n")      # Write data_dir with a newline
         f.write(f"every_t: {every_t}\n")        # Write every_t with a newline
         
     save_params(output_params, exp_path)
 
+    #TODO: Need to write the NVS eval
+    # render_eval
+
 
 
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="/projects/4DTimelapse/Dynamic3DGaussiansBaseline/plant_data/rose_mini")
+    parser.add_argument("--data_dir", "-d", default="./plant_data/rose_mini")
     parser.add_argument("--name", "-n", type=str, default="exp1")
     parser.add_argument("--every_t", "-t", type=int, default=10)
     args = parser.parse_args()
