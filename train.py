@@ -28,11 +28,9 @@ from argparse import ArgumentParser
 import imageio.v2 as imageio
 from helpers import knn
 
-def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids=None):
+def get_dataset(t, images, cam_to_worlds_dict, intrinsics):
     """
     Retrieve all cameras for timestep t.
-    If t != 0, only retrieve the cameras from selected_cam_ids. We want to simulate 27 cameras on last timestep and only 9 
-    otherwise.
     """
     data = {
         "K": intrinsics,
@@ -44,7 +42,6 @@ def get_dataset(t, images, cam_to_worlds_dict, intrinsics, selected_cam_ids=None
     height, width = images[all_camera_indices[0]][0].shape[0], images[all_camera_indices[0]][0].shape[1]
     
     for camera_id, img_list in images.items():
-        # if t == 0 or camera_id in selected_cam_ids:
         data["camtoworld"][camera_id] = cam_to_worlds_dict[camera_id]
         data["image"][camera_id] = torch.from_numpy(img_list[t]).float() #retrieves 
             # data["image_id"][camera_id] = self.image_ids_dict[camera_id][timestep]
@@ -548,16 +545,11 @@ def train(data_dir, exp, every_t):
         f.write(f"every_t: {every_t}\n")        # Write every_t with a newline
         
     save_params(output_params, exp_path)
-
-    #TODO: Need to write the NVS eval
-    # render_eval
-
-
-
+    
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="./plant_data/rose_mini")
+    parser.add_argument("--data_dir", "-d", default="./plant_data/rose")
     parser.add_argument("--name", "-n", type=str, default="exp1")
     parser.add_argument("--every_t", "-t", type=int, default=10)
     args = parser.parse_args()
