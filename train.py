@@ -28,6 +28,39 @@ from argparse import ArgumentParser
 import imageio.v2 as imageio
 from helpers import knn
 
+def generate_360_path(num_timesteps:int):
+    """
+    Generate a 360 degree rendering of c2w poses, taken from TineuVox
+    https://github.com/hustvl/TiNeuVox/blob/main/lib/load_dnerf.py
+    """
+    trans_t = lambda t : torch.Tensor([  # noqa: E731
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,t],
+    [0,0,0,1]]).float()
+
+    rot_phi = lambda phi : torch.Tensor([  # noqa: E731
+        [1,0,0,0],
+        [0,np.cos(phi),-np.sin(phi),0],
+        [0,np.sin(phi), np.cos(phi),0],
+        [0,0,0,1]]).float()
+
+    rot_theta = lambda th : torch.Tensor([  # noqa: E731, F821
+        [np.cos(th),0,-np.sin(th),0],
+        [0,1,0,0],
+        [np.sin(th),0, np.cos(th),0],
+        [0,0,0,1]]).float()
+
+    def pose_spherical(theta, phi, radius):
+        c2w = trans_t(radius)
+        c2w = rot_phi(phi/180.*np.pi) @ c2w
+        c2w = rot_theta(theta/180.*np.pi) @ c2w
+        c2w = torch.Tensor(np.array([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]])) @ c2w
+        return c2w
+    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,num_timesteps+1)[:-1]], 0)
+    render_poses[..., 0:3, 1:3] *= -1 #flip sign for y and z
+    return render_poses
+
 def get_dataset(t, images, cam_to_worlds_dict, intrinsics):
     """
     Retrieve all cameras for timestep t.
@@ -170,11 +203,11 @@ def rasterize_splats(
     width: int,
     height: int,
     masks: Optional[Tensor] = None,
-    **kwargs,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """
     Rasterize the splats, assume they are already activated
     module with the color of the splat.
+    Also notice here we use near plane and far plane ONLY for blender scene!
 
     Return 
     -Rasterized image
@@ -198,7 +231,8 @@ def rasterize_splats(
         absgrad=False,
         sparse_grad=False,
         rasterize_mode=rasterize_mode,
-        **kwargs,
+        near_plane=2.0,
+        far_plane=6.0
     )
     if masks is not None:
         render_colors[~masks] = 0
@@ -403,7 +437,8 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
                  "height": dataset["height"]}
 
     all_camera_indices = list(dataset["camtoworld"])
-
+    train_path = os.path.join(exp_path, "train")
+    os.makedirs(train_path, exist_ok=True)
     # elapsed_time = 0
     metrics = defaultdict(list)
     for camera_indx in all_camera_indices:
@@ -449,7 +484,7 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
         canvas = torch.cat(canvas_list, dim=1).squeeze(0).cpu().numpy()
         canvas = (canvas * 255).astype(np.uint8)
         imageio.imwrite(
-            f"{exp_path}/t_{timestep}_iter_{iteration}_{camera_indx}.png",
+            f"{train_path}/t_{timestep}_iter_{iteration}_{camera_indx}.png",
             canvas,
         )
 
@@ -539,6 +574,36 @@ def train(data_dir, exp, every_t):
         output_params.append(params2cpu(params, is_initial_timestep))
         if is_initial_timestep:
             variables = initialize_post_first_timestep(params, variables, optimizer)
+            camtoworlds_all = generate_360_path(num_timesteps=40)
+            video_dir = f"{exp_path}/static_360_videos"
+            os.makedirs(video_dir, exist_ok=True)
+            writer = imageio.get_writer(f"{video_dir}/static_traj.mp4", fps=30, macro_block_size=1)
+            rendervar = params2rendervar(params)
+            means = rendervar["means"]
+            rgbs = rendervar["colors"]
+            quats = rendervar["quats"]
+            opacities = rendervar["opacities"]
+            scales = rendervar["scales"]
+            for i in range(len(camtoworlds_all)):
+                camtoworlds = camtoworlds_all[i : i + 1].to("cuda")
+                Ks = dataset["K"][None].to("cuda")
+                renders, _, _ = rasterize_splats(
+                    means=means,
+                    quats = quats,
+                    opacities=opacities,
+                    scales=scales,
+                    colors=rgbs,
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=dataset["width"],
+                    height=dataset["height"],
+                )  # [1, H, W, 4]
+                colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+                colors = colors.squeeze(0).detach().cpu().numpy()
+                colors = (colors * 255).astype(np.uint8)
+                writer.append_data(colors)
+            writer.close()
+            print(f"Video saved to {video_dir}/static_traj.mp4")
 
     with open(f"{exp_path}/cfg.txt", "w") as f:
         f.write(f"data_dir: {data_dir}\n")      # Write data_dir with a newline

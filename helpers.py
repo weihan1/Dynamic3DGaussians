@@ -123,10 +123,11 @@ def focal2fov(focal, pixels):
 def params2rendervar(params):
     """
     Activate the parameters. Quaternions do not need to be normalized.
+    Also need to activate the colors
     """
     rendervar = {
         'means': params['means'],
-        'colors': params['rgbs'],
+        'colors': torch.sigmoid(params['rgbs']),
         'quats': params['quats'],
         'opacities': torch.sigmoid(params['opacities']),
         'scales': torch.exp(params['scales']),
