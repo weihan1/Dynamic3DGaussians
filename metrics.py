@@ -1,7 +1,3 @@
-"""
-Use this script to reproduce the dynamic 3DGS baseline on our custom plant dataset.
-Notice for our dataset we do not
-"""
 import os
 os.environ['TORCH_CUDA_ARCH_LIST'] = '7.5;8.6'
 import torch
@@ -17,20 +13,207 @@ from typing import Optional, Tuple, Dict
 from collections import defaultdict
 from datetime import datetime
 from glob import glob
+from gsplat import rasterization
 
 # Use our own rasterizer for fair comparison
 # from diff_gaussian_rasterization import GaussianRasterizer as Renderer
-from gsplat import rasterization, DefaultStrategy
 from helpers import l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult, \
     o3d_knn, params2rendervar, params2cpu, save_params
-from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
+
+from external import calc_psnr, build_rotation, densify, update_params_and_optimizer
 from argparse import ArgumentParser
 import imageio.v2 as imageio
 from helpers import knn
 
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.animation import FuncAnimation
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+def visualize_point_cloud(point_clouds, output_file="point_cloud.png", subsample_factor=1, 
+                          point_size=20, figsize=(10, 8), view_angles=None, color='blue', zoom_factor=0.5):
+    """
+    Visualize a single-time point clouds (N, 3)
+    This can be helpful for visualizing point cloud trajectory
+    """
+    if isinstance(point_clouds, torch.Tensor):
+        point_clouds = point_clouds.cpu().numpy()
+
+    point_clouds = point_clouds[::subsample_factor,:]
+    N, _ = point_clouds.shape
+    min_vals = point_clouds.min(axis=0)
+    max_vals = point_clouds.max(axis=0)
+    center = (min_vals + max_vals) / 2
+    max_range = max(max_vals - min_vals)
+    
+    # Create figure and 3D axes
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Extract coordinates
+    x = point_clouds[:, 0]
+    y = point_clouds[:, 1]
+    z = point_clouds[:, 2]
+    
+    # Create scatter plot
+    scatter = ax.scatter(x, y, z, s=point_size, c=color, alpha=0.8)
+    
+    # Set axis labels
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    
+    # Set title
+    ax.set_title(f'Point Cloud Visualization ({N} points)')
+    
+    # Set view angle if specified
+    if view_angles is not None:
+        ax.view_init(elev=view_angles[0], azim=view_angles[1])
+    
+    # Set zoomed-in axis limits based on min/max and zoom factor
+    ax.set_xlim([center[0] - max_range * zoom_factor, center[0] + max_range * zoom_factor])
+    ax.set_ylim([center[1] - max_range * zoom_factor, center[1] + max_range * zoom_factor])
+    ax.set_zlim([center[2] - max_range * zoom_factor, center[2] + max_range * zoom_factor])
+    
+    # Add coordinate axes for orientation reference
+    max_length = max_range * 0.2  # Length of the coordinate axes lines
+    origin = center - max_range * 0.4  # Offset origin point
+    
+    # X axis - red
+    ax.plot([origin[0], origin[0] + max_length], [origin[1], origin[1]], [origin[2], origin[2]], 'r-', linewidth=2)
+    ax.text(origin[0] + max_length * 1.1, origin[1], origin[2], 'X', color='red')
+    
+    # Y axis - green
+    ax.plot([origin[0], origin[0]], [origin[1], origin[1] + max_length], [origin[2], origin[2]], 'g-', linewidth=2)
+    ax.text(origin[0], origin[1] + max_length * 1.1, origin[2], 'Y', color='green')
+    
+    # Z axis - blue
+    ax.plot([origin[0], origin[0]], [origin[1], origin[1]], [origin[2], origin[2] + max_length], 'b-', linewidth=2)
+    ax.text(origin[0], origin[1], origin[2] + max_length * 1.1, 'Z', color='blue')
+    
+    # Add rotation indicators
+    plt.tight_layout()
+    
+    # Save figure
+    plt.savefig(output_file, dpi=300)
+    print(f"Visualization saved to {output_file}")
+    
+    # Show the plot
+    plt.show()
+    
+    return fig, ax
+
+def animate_point_clouds(point_clouds, output_file="point_cloud_animation.mp4", fps=10, 
+                         point_size=20, figsize=(10, 8), view_angles=None, color='blue', is_reverse=True,
+                         t_subsample=1):
+    """
+    Animate a sequence of point clouds and save as a video.
+    
+    Parameters:
+    -----------
+    point_clouds : numpy.ndarray
+        Point clouds of shape (T, N, 3) where:
+        - T is the number of frames
+        - N is the number of points
+        - 3 represents the XYZ coordinates
+    output_file : str
+        Output filename for the video (mp4 format)
+    fps : int
+        Frames per second for the video
+    point_size : int
+        Size of points in the visualization
+    figsize : tuple
+        Figure size (width, height) in inches
+    view_angles : list or None
+        Initial view angles [elevation, azimuth] if specified
+    color : str or array
+        Color of the points
+    is_reverse: bool
+        whether or not the trajectory is reversed
+    subsample_rate: float 
+        subsampling rate for the tensor, between (0,1)
+    """
+    if isinstance(point_clouds, torch.Tensor):
+        point_clouds = point_clouds.cpu().numpy()
+    every_n = int(1/t_subsample)
+    point_clouds = point_clouds[::every_n,:,:]
+    # Get data dimensions
+    T, N, _ = point_clouds.shape
+    
+    if is_reverse:
+        point_clouds = np.flip(point_clouds, axis=0)
+     
+    # Create figure and 3D axes
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Initialize scatter plot
+    scatter = ax.scatter([], [], [], s=point_size, c=color, alpha=0.8)
+    
+    # Set axis labels
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+   
+    # Fixed limits for Blender scenes
+    ax.set_xlim([-2, 2])
+    ax.set_ylim([-2, 2])
+    ax.set_zlim([-2, 2])
+
+    # Set title
+    ax.set_title('Point Cloud Animation')
+    
+    # Set initial view angle if specified
+    if view_angles is not None:
+        ax.view_init(elev=view_angles[0], azim=view_angles[1])
+    
+    def update(frame):
+        """ Update function for each frame """
+        x, y, z = point_clouds[frame, :, 0], point_clouds[frame, :, 1], point_clouds[frame, :, 2]
+        
+        # Update scatter plot data
+        scatter._offsets3d = (x, y, z)
+        
+        # Update frame title correctly
+        ax.title.set_text(f'Point Cloud Animation - Frame {frame+1}/{T}')
+        return scatter,
+    
+    # Create animation
+    anim = FuncAnimation(
+        fig, update, frames=T, 
+        interval=1000/fps
+    )
+
+    # Fixed coordinate system settings
+    max_range = 2.0  # Fixed to match [-2,2] scene
+    center = np.array([-1, -3, 0])  # make the origin of the axes on the bottom left side
+    max_length = max_range * 0.4  # Length of coordinate axes
+    
+    # X axis - Red
+    ax.plot([center[0], center[0] + max_length], [center[1], center[1]], [center[2], center[2]], 'r-', linewidth=2)
+    ax.text(center[0] + max_length * 1.1, center[1], center[2], 'X', color='red')
+
+    # Y axis - Green
+    ax.plot([center[0], center[0]], [center[1], center[1] + max_length], [center[2], center[2]], 'g-', linewidth=2)
+    ax.text(center[0], center[1] + max_length * 1.1, center[2], 'Y', color='green')
+
+    # Z axis - Blue
+    ax.plot([center[0], center[0]], [center[1], center[1]], [center[2], center[2] + max_length], 'b-', linewidth=2)
+    ax.text(center[0], center[1], center[2] + max_length * 1.1, 'Z', color='blue')
+
+    # Save animation as MP4
+    writer = animation.FFMpegWriter(fps=fps)
+    anim.save(output_file, writer=writer)
+    print(f"Animation saved to {output_file}")
+    
+    plt.close()
+
 def get_dataset(t, images, cam_to_worlds_dict, intrinsics):
     """
     Retrieve all cameras for timestep t.
+    If t != 0, only retrieve the cameras from selected_cam_ids. We want to simulate 27 cameras on last timestep and only 9 
+    otherwise.
     """
     data = {
         "K": intrinsics,
@@ -44,7 +227,7 @@ def get_dataset(t, images, cam_to_worlds_dict, intrinsics):
     for camera_id, img_list in images.items():
         data["camtoworld"][camera_id] = cam_to_worlds_dict[camera_id]
         data["image"][camera_id] = torch.from_numpy(img_list[t]).float() #retrieves 
-            # data["image_id"][camera_id] = self.image_ids_dict[camera_id][timestep]
+        # data["image_id"][camera_id] = self.image_ids_dict[camera_id][timestep]
     data["width"] = width
     data["height"] = height 
     return data
@@ -126,37 +309,37 @@ def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=True, num_g
     trainset_scene_scale = np.max(dists)
     global_scale = 1.0
     scene_scale = trainset_scene_scale * 1.1 * global_scale
-    init_extent = 0.5
-    init_scale = 1.0
-    init_opacity = 0.1
+    # init_extent = 0.5
+    # init_scale = 1.0
+    # init_opacity = 0.1
     
     #initialize the parameters
-    points = init_extent * scene_scale * (torch.rand((num_gaussians, 3)) * 2 - 1)
-    print(f"points are initialized in [{points.min(), points.max()}]")
-    rgbs = torch.rand((num_gaussians, 3))
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    # points = init_extent * scene_scale * (torch.rand((num_gaussians, 3)) * 2 - 1)
+    # print(f"points are initialized in [{points.min(), points.max()}]")
+    # rgbs = torch.rand((num_gaussians, 3))
+    # dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    # dist_avg = torch.sqrt(dist2_avg)
+    # scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    # N = points.shape[0]
+    # quats = torch.rand((N, 4))  # [N, 4]
+    # opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
-    params = {
-        'means': points,
-        'rgbs': rgbs,
-        'quats':  quats, 
-        'opacities': opacities,
-        'scales': scales,
-    }
+    # params = {
+    #     'means': points,
+    #     'rgbs': rgbs,
+    #     'quats':  quats, 
+    #     'opacities': opacities,
+    #     'scales': scales,
+    # }
 
-    params = {k: torch.nn.Parameter(v.cuda().float().contiguous().requires_grad_(True)) for k, v in
-              params.items()}
+    # params = {k: torch.nn.Parameter(v.cuda().float().contiguous().requires_grad_(True)) for k, v in
+    #           params.items()}
 
     
     variables = {'scene_scale': scene_scale,
                  'fixed_bkgd': torch.zeros(1, 3, device="cuda")} #fixed black background we use for rendering eval for instance.
 
-    return params, variables, images, cam_to_worlds_dict, intrinsics
+    return variables, images, cam_to_worlds_dict, intrinsics
 
 
 def rasterize_splats(
@@ -223,80 +406,6 @@ def initialize_optimizer(params, variables):
         for name, lr in lrs.items()
     }
     return optimizer
-
-
-def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strategy, strategy_state, i, use_random_bkgd = True):
-    """
-    Rasterize image and compute loss
-    If use_random_bkgd is true, train our method by blending it with a random background at each training iteration.
-    Else, do not blend. NOTE: in their original code, they do not use spherical harmonics.
-    """
-    losses = {}
-    rendervar = params2rendervar(params)
-    means = rendervar["means"]
-    colors = rendervar["colors"]
-    quats = rendervar["quats"]
-    opacities = rendervar["opacities"]
-    scales = rendervar["scales"]
-    im, alphas, info = rasterize_splats(means, quats, scales, opacities, colors,
-                                            camtoworlds=curr_data["c2w"][None], Ks=curr_data["Ks"],
-                                            width=curr_data["width"], height=curr_data["height"])
-    if is_initial_timestep:
-        strategy.step_pre_backward(params=params, optimizers=optimizer, 
-                                   state=strategy_state, step=i, info=info) #retains gradients for 2d means
-
-    gt_image = curr_data["image"]
-    fixed_bkgd = variables["fixed_bkgd"]
-    gt_has_alpha = gt_image.shape[-1] == 4
-    if use_random_bkgd:
-        bkgd = torch.rand(1, 3, device="cuda") #this blends a new bkgd at every iteration
-    else:
-        bkgd = fixed_bkgd
-
-    if gt_has_alpha:
-        gt_alpha = gt_image[..., [-1]]
-        gt_rgb = gt_image[..., :3]
-        pixels = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
-        im = im + bkgd * (1.0 - alphas)
-    elif use_random_bkgd:
-        colors = colors + bkgd * (1.0 - alphas)
-
-    losses['im'] = 0.8 * l1_loss_v1(im, pixels) + 0.2 * (1.0 - calc_ssim(im, pixels))
-
-    if not is_initial_timestep:
-        # is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
-        fg_pts = rendervar['means']
-        fg_rot = rendervar['quats']
-
-        rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"]) #quaternion multiplication q_{t} * q_{t-1}^-1
-        rot = build_rotation(rel_rot) #build rotation from quaternion
-        neighbor_pts = fg_pts[variables["neighbor_indices"]]
-        curr_offset = neighbor_pts - fg_pts[:, None]
-        curr_offset_in_prev_coord = (rot.transpose(2, 1)[:, None] @ curr_offset[:, :, :, None]).squeeze(-1)
-        losses['rigid'] = weighted_l2_loss_v2(curr_offset_in_prev_coord, variables["prev_offset"],
-                                              variables["neighbor_weight"])
-
-        losses['rot'] = weighted_l2_loss_v2(rel_rot[variables["neighbor_indices"]], rel_rot[:, None],
-                                            variables["neighbor_weight"])
-
-        curr_offset_mag = torch.sqrt((curr_offset ** 2).sum(-1) + 1e-20)
-        losses['iso'] = weighted_l2_loss_v1(curr_offset_mag, variables["neighbor_dist"], variables["neighbor_weight"])
-
-        #TODO: enable these losses after, first use rigid, rot and iso
-        # losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
-
-        # bg_pts = rendervar['means3D'][~is_fg]
-        # bg_rot = rendervar['rotations'][~is_fg]
-        # losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
-
-        # losses['soft_col_cons'] = l1_loss_v2(params['rgbs'], variables["prev_col"])
-
-    loss_weights = {'im': 1.0, 'seg': 3.0, 'rigid': 4.0, 'rot': 4.0, 'iso': 2.0, 'floor': 2.0, 'bg': 20.0,
-                    'soft_col_cons': 0.01}
-    loss = sum([loss_weights[k] * v for k, v in losses.items()])
-
-    return loss, variables, info
-
 
 def initialize_per_timestep(params, variables, optimizer):
     pts = params['means']
@@ -391,8 +500,22 @@ def report_progress(params, variables, dataset, i, progress_bar, cam_ind=0, ever
                                   "num_gauss": means.shape[0]})
         progress_bar.update(every_i)
 
+def save_gt_video(video_duration, video, cam_index, full_out_path, is_reverse=True):
+    """
+    Given an array of frames, and cam index, save that video to full_out_path
+    """
+    #no need to background blend
+    selected_video = video[cam_index]
+    selected_video = np.stack(selected_video, axis=0)
+    fps = len(selected_video)/video_duration
+    if is_reverse:
+        selected_video = np.flip(selected_video, axis=0)
+    imageio.mimwrite(full_out_path, (selected_video*255).astype(np.uint8), fps=fps)
+
+    
+
 @torch.no_grad()
-def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
+def render_imgs(dataset, params, variables, val_path, timestep, iteration):
     """
     Render a canvas with pred and gt images.
     Given dataset, render images from all possible views of this dataset.
@@ -404,9 +527,17 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
 
     all_camera_indices = list(dataset["camtoworld"])
 
+    calc_ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to("cuda")
+    calc_lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True).to("cuda") #. If set to True will instead expect input to be in the [0,1] range.
+
     # elapsed_time = 0
     metrics = defaultdict(list)
-    for camera_indx in all_camera_indices:
+    float_metrics = defaultdict(list)
+    num_cameras = len(all_camera_indices)
+    h,w = dataset["image"]["r_0"].shape[0], dataset["image"]["r_0"].shape[1]
+
+    pred_images = torch.zeros(num_cameras, h, w, 3)
+    for i, camera_indx in enumerate(all_camera_indices):
         selected_c2w = dataset["camtoworld"][camera_indx]
         selected_image = dataset["image"][camera_indx]
         curr_data["c2w"] = selected_c2w.to("cuda")
@@ -420,7 +551,6 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
         im, alphas, info = rasterize_splats(means, quats, scales, opacities, colors,
                                                 camtoworlds=curr_data["c2w"][None], Ks=curr_data["Ks"],
                                                 width=curr_data["width"], height=curr_data["height"])
-
         gt_image = curr_data["image"]
         fixed_bkgd = variables["fixed_bkgd"]
         gt_has_alpha = gt_image.shape[-1] == 4
@@ -449,112 +579,123 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
         canvas = torch.cat(canvas_list, dim=1).squeeze(0).cpu().numpy()
         canvas = (canvas * 255).astype(np.uint8)
         imageio.imwrite(
-            f"{exp_path}/t_{timestep}_iter_{iteration}_{camera_indx}.png",
+            f"{val_path}/t_{timestep}_eval_{camera_indx}.png",
             canvas,
         )
 
         #Compute masked psnr 
-    #     pred_image = eval_colors.squeeze()
-    #     gt_image = eval_pixels.squeeze()
-    #     if gt_has_alpha:
-    #         mask = (gt_alpha > 0).squeeze()
-    #         metrics["psnr"].append(calc_psnr(pred_image, gt_image, mask))
-    #     else:
-    #         metrics["psnr"].append(calc_psnr(pred_image, gt_image))
+        pred_image = eval_colors.squeeze() #(H,W,3)
+        pred_images[i] = pred_image
+        gt_image = eval_pixels
+        if gt_has_alpha:
+            mask = (gt_alpha > 0).squeeze()
+            psnr_value = calc_psnr(pred_image, gt_image, mask)
+        else:
+            psnr_value = calc_psnr(pred_image, gt_image)
 
-    #     #TODO: fix these after wednesday's presentation
-    #     # pixels_p = eval_pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-    #     # colors_p = eval_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-    #     # metrics["ssim"].append(calc_ssim(colors_p, pixels_p))
-    #     # metrics["lpips"].append(calc_lpips(colors_p, pixels_p))
+        _ssim = calc_ssim(eval_colors.permute(0,3,1,2), eval_pixels.unsqueeze(0).permute(0,3,1,2))
+        _lpips = calc_lpips(eval_colors.permute(0,3,1,2), eval_pixels.unsqueeze(0).permute(0,3,1,2))
+        metrics["psnr"].append(psnr_value)
+        metrics["ssim"].append(_ssim)
+        metrics["lpips"].append(_lpips)
 
-    # # elapsed_time /= len(valloader)
+        #Use float_metrics to store the float values as opposed to torch tensors
+        float_metrics["psnr"].append(round(psnr_value.item(), 2))
+        float_metrics["ssim"].append(round(_ssim.item(), 3))
+        float_metrics["lpips"].append(round(_lpips.item(), 3))
 
-    # stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-    # stats.update(
-    #     {
-    #         # "elapsed_time": elapsed_time,
-    #         "num_GS": params["means"].shape[0],
-    #     }
-    # )
-    # print(f"The PSNR at time {timestep}, iteration {iteration}: {stats['psnr']:.3f}")
-    # # print(
-    # #     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-    # #     f"Number of GS: {stats['num_GS']}"
-    # # )
-    # # save stats as json
-    # with open(f"{exp_path}/timestep_{timestep}_iter_{iteration}.json", "w") as f:
-    #     json.dump(stats, f)
-
-
-
-def train(data_dir, exp, every_t):
-    """Training script for the rose scene, specifically tailored from my custom dataset."""
-    scene_name = data_dir.split("/")[-1]
-    now = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
-    exp_path = f"./output/{exp}/{scene_name}_{now}"
-    os.makedirs(exp_path, exist_ok=True)
-    md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
-    plot_intervals = [1, 599, 1999, 6999, 9999] 
-    strategy = DefaultStrategy()
-    strategy.refine_stop_iter = 5000 #original code base only prunes before iteration 5000
-    params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
-    timesteps = list(range(0, len(images["r_1"]))) #assuming all cameras have the same number of timesteps
-    num_timesteps = len(timesteps)
-    print(f"training our method on {num_timesteps} timesteps")
-    optimizer = initialize_optimizer(params, variables)
-
-    # Do the strategy stuff here
-    strategy.check_sanity(params, optimizer)
-    strategy_state = strategy.initialize_state() #initializes running state
-    output_params = [] #contain the gaussians params for each timestep.
-    for t in timesteps: #training on timestep t
-        dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
-        num_cams = len(dataset["image"])
-        cam_ind = list(dataset["image"])
-        print(f"start training on time {t} with {num_cams} cameras \n")
-        print(f"the camera indices are {cam_ind}")
-        is_initial_timestep = (t == 0)
-        if not is_initial_timestep:
-            params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 30_000 if is_initial_timestep else 2000
-        progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
-        for i in range(num_iter_per_timestep):
-            curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
-            loss, variables, info = get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strategy, strategy_state, i)
-            loss.backward()
-            if is_initial_timestep:
-                strategy.step_post_backward(params, optimizer, strategy_state, i, info) #growing and pruning
-            with torch.no_grad():
-                report_progress(params, variables, dataset, i, progress_bar)
-                for opt in optimizer.values():
-                    opt.step()
-                    opt.zero_grad(set_to_none=True)
-
-            if i in plot_intervals: 
-                render_imgs(dataset, params, variables, exp_path, t, i)       
-                # continue
-
-        progress_bar.close()
-        output_params.append(params2cpu(params, is_initial_timestep))
-        if is_initial_timestep:
-            variables = initialize_post_first_timestep(params, variables, optimizer)
-
-    with open(f"{exp_path}/cfg.txt", "w") as f:
-        f.write(f"data_dir: {data_dir}\n")      # Write data_dir with a newline
-        f.write(f"every_t: {every_t}\n")        # Write every_t with a newline
-        
-    save_params(output_params, exp_path)
     
+    #metrics keep a dict of metrics where each metric is a list of values
+    
+    return metrics, float_metrics, pred_images 
+
+@torch.no_grad() 
+def render_eval(exp_path, data_dir, every_t):
+    """Render eval stuff"""
+    #1. Open transforms_test.json
+    #2. Load test images     params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
+    #3. Load the gaussian parameters 
+    #4. Render predicted vs gt on the test pose
+    #5. Loop over the number of timesteps and the number of test poses and compute psnr
+    #6. save videos
+    #NOTE: Recall in dynamic3DGS, we freeze everything except ['opacities', 'scales']
+
+    md_test = json.load(open(f"{data_dir}/transforms_test.json", 'r'))
+    variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md_test, every_t)
+    param_path = glob(f"{exp_path}/*.npz")[0]
+    param_dict = np.load(param_path) #each param is of shape (T, N, F)
+    params = {}
+    timestep_stats = {}
+    all_psnr_values = []
+    all_ssim_values = []
+    all_lpips_values = []
+
+    val_path = os.path.join(exp_path, "eval")
+    os.makedirs(val_path, exist_ok=True)
+
+    for k,v in param_dict.items():
+        params[k] = torch.tensor(v).to("cuda")
+    num_timesteps = params["means"].shape[0]
+    render_img_frames = np.zeros((num_timesteps, len(images.keys()), 400, 400, 3))
+    for t in range(num_timesteps):  
+        dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
+        for cam_index in dataset["camtoworld"].keys():
+            save_gt_video(video_duration=3, video=images, cam_index=cam_index, full_out_path=f"{val_path}/gt_video_cam_{cam_index}.mp4", is_reverse=True)
+
+        time_params = {k: v[t] for k,v in params.items()}
+        num_cams = len(dataset["image"])
+        cam_indices = list(dataset["image"])
+        metrics, float_metrics, pred_image = render_imgs(dataset, time_params, variables, val_path, t, iteration=0)
+        render_img_frames[t] = pred_image.cpu().numpy()
+
+        #collect all metrics
+        all_psnr_values.extend(metrics["psnr"])  # Collect all PSNR values
+        all_ssim_values.extend(metrics["ssim"])
+        all_lpips_values.extend(metrics["lpips"])
+
+        timestep_stats[t] = {
+            "per_camera_psnr": float_metrics["psnr"],
+            "per_camera_ssim": float_metrics["ssim"],
+            "per_camera_lpips": float_metrics["lpips"]
+            }
+
+    fps = len(render_img_frames)/3
+    render_img_frames = np.flip(render_img_frames, axis=0)
+    for i in range(len(dataset["camtoworld"].keys())):
+        outpath = f"{val_path}/rendered_video_cam_{i}.mp4"
+        imageio.mimwrite(outpath, (render_img_frames[:, i].squeeze()*255).astype(np.uint8), fps=fps)
+
+    overall_mean_psnr = torch.stack(all_psnr_values).mean().item()
+    overall_mean_ssim = torch.stack(all_ssim_values).mean().item()
+    overall_mean_lpips = torch.stack(all_lpips_values).mean().item()
+
+    stats = {
+        "overall_mean_psnr": overall_mean_psnr,
+        "overal_mean_ssim": overall_mean_ssim,
+        "overall_mean_lpips": overall_mean_lpips,
+        "timestep_stats": timestep_stats
+        }
+    with open(f"{val_path}/eval_metrics.json", "w") as f:
+        json.dump(stats, f)
+
+    threshold = 0.3 
+    opacity_t0 = params["opacities"][0] #take opacity at t=0 for pruning 
+    above_threshold_mask = (torch.sigmoid(opacity_t0) > threshold) #(N)
+    visible_points = params["means"][:, above_threshold_mask, :]
+    torch.save(visible_points, f"{exp_path}/point_cloud_trajectory.pt")
+    # visualize_point_cloud(visible_points[0])
+    animate_point_clouds(visible_points.cpu(), output_file=f"{exp_path}/point_cloud_animation.mp4",
+                            is_reverse=True, t_subsample=1)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--data_dir", "-d", default="./plant_data/rose")
-    parser.add_argument("--name", "-n", type=str, default="exp1")
-    parser.add_argument("--every_t", "-t", type=int, default=10)
+    parser.add_argument("--exp_path", "-p", default="./output/exp1/rose_all_cams_15_timesteps")
+    parser.add_argument("--every_t", "-t", type=int, default=10) #for eval need to match the number of point clouds saved
     args = parser.parse_args()
     data_dir = args.data_dir
-    exp_name = args.name
     every_t = args.every_t
-    train(data_dir, exp_name, every_t)
+    exp_path = args.exp_path
+    render_eval(exp_path, data_dir, every_t)
+    print("Done eval")
     torch.cuda.empty_cache()
