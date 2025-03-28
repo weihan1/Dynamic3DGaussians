@@ -316,9 +316,10 @@ def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strat
         curr_offset_mag = torch.sqrt((curr_offset ** 2).sum(-1) + 1e-20)
         losses['iso'] = weighted_l2_loss_v1(curr_offset_mag, variables["neighbor_dist"], variables["neighbor_weight"])
 
-        #TODO: enable these losses after, first use rigid, rot and iso
+        #NOTE: these other losses don't improve the result.
         # losses['floor'] = torch.clamp(fg_pts[:, 1], min=0).mean()
 
+        #Can't use these losses because no fg/bg
         # bg_pts = rendervar['means3D'][~is_fg]
         # bg_rot = rendervar['rotations'][~is_fg]
         # losses['bg'] = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
@@ -378,6 +379,13 @@ def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
     variables["prev_pts"] = params["means"].detach()
     variables["prev_rot"] = torch.nn.functional.normalize(params["quats"]).detach()
     params_to_fix = ['opacities', 'scales']
+    # params_to_fix = ['scales']
+    # params_to_fix = ['opacities']
+    # params_to_fix = []
+    if len(params_to_fix) == 0:
+        print("nothing to freeze")
+    else:
+        print(f"freezing {params_to_fix[0]}")
     for param_name, opt_class in optimizer.items():
         if param_name in params_to_fix:
             opt_class.param_groups[0]["lr"] = 0.0
