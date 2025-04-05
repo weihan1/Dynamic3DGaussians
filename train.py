@@ -26,6 +26,7 @@ from helpers import l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_los
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 from argparse import ArgumentParser
 import imageio.v2 as imageio
+import cv2
 from helpers import knn
 
 def generate_360_path(num_timesteps:int):
@@ -102,7 +103,7 @@ def get_batch(dataset):
     return curr_data
 
 
-def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=True, num_gaussians=100_000):
+def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=True, num_gaussians=100_000, target_shape=(400,400), use_blender_mask=True):
     """
     Use this when training on custom plant dataset.
     It has "camera_angle_x" and "frames" as keys
@@ -119,6 +120,12 @@ def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=True, num_g
         file_path = os.path.join(data_dir, image_ids)
         camera_id = image_ids.split("/")[-2]
         img = imageio.imread(file_path)
+        img = cv2.resize(img, target_shape)
+        if use_blender_mask:
+            if img.shape[-1] == 4 and (img[...,-1] == 255).all(): #if blender scene with non-transparent background
+                img = img[...,:3] #no mask if background provided
+        else: #if don't use blender mask, automatically discard the last channel.
+            img = img[..., :3]
         norm_img = img/255.0
         norm_img[norm_img<0.1] = 0 #get rid of some background noise from blender scenes
         norm_img = np.clip(norm_img, 0, 1) 
@@ -138,6 +145,7 @@ def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=True, num_g
         progress_bar.update(1)
         images_ids_lst.append(image_ids)
 
+    print(f"Using every {every_t} images")
     for camera_id in images.keys(): #subsample the image list for each camera, btw this downsamples in both splits
         images[camera_id] = images[camera_id][::-every_t] if is_reverse else images[camera_id][::every_t]
         image_ids_dict[camera_id] = image_ids_dict[camera_id][::-every_t] if is_reverse else image_ids_dict[camera_id][::every_t]
@@ -259,7 +267,7 @@ def initialize_optimizer(params, variables):
     return optimizer
 
 
-def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strategy, strategy_state, i, use_random_bkgd = True):
+def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strategy, strategy_state, i, use_random_bkgd = False):
     """
     Rasterize image and compute loss
     If use_random_bkgd is true, train our method by blending it with a random background at each training iteration.
@@ -290,12 +298,12 @@ def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strat
     if gt_has_alpha:
         gt_alpha = gt_image[..., [-1]]
         gt_rgb = gt_image[..., :3]
-        pixels = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
+        gt_image = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
         im = im + bkgd * (1.0 - alphas)
     elif use_random_bkgd:
-        colors = colors + bkgd * (1.0 - alphas)
+        im = im + bkgd * (1.0 - alphas)
 
-    losses['im'] = 0.8 * l1_loss_v1(im, pixels) + 0.2 * (1.0 - calc_ssim(im, pixels))
+    losses['im'] = 0.8 * l1_loss_v1(im, gt_image) + 0.2 * (1.0 - calc_ssim(im, gt_image))
 
     if not is_initial_timestep:
         # is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
@@ -392,7 +400,7 @@ def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
     return variables
 
 
-def report_progress(params, variables, dataset, i, progress_bar, cam_ind=0, every_i=100, use_random_bkgd=True):
+def report_progress(params, variables, dataset, i, progress_bar, cam_ind=0, every_i=100, use_random_bkgd=False):
     """
     Report progress on the camera of cam_ind. Using the same post-processing scheme from training.
     NOTE: record masked psnr.
@@ -421,14 +429,17 @@ def report_progress(params, variables, dataset, i, progress_bar, cam_ind=0, ever
             gt_alpha = gt_image[..., [-1]]
             mask = (gt_alpha > 0).squeeze() #do not use a hardcap at 1
             gt_rgb = gt_image[..., :3]
-            pixels = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
+            gt_image = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
             pred_image = pred_image + bkgd * (1.0 - alphas)
         elif use_random_bkgd:
-            colors = colors + bkgd * (1.0 - alphas)
+            pred_image = pred_image + bkgd * (1.0 - alphas)
 
         pred_image = torch.clamp(pred_image, 0, 1).squeeze()
-        gt_image = torch.clamp(pixels, 0, 1).squeeze() 
-        psnr = calc_psnr(pred_image, gt_image, mask)
+        gt_image = torch.clamp(gt_image, 0, 1).squeeze() 
+        if gt_has_alpha:
+            psnr = calc_psnr(pred_image, gt_image, mask)
+        else:
+            psnr = calc_psnr(pred_image, gt_image)
         progress_bar.set_postfix({f"train img {cam_ind} mask PSNR": f"{psnr:.{2}f}",
                                   "num_gauss": means.shape[0]})
         progress_bar.update(every_i)
@@ -483,8 +494,8 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
             image_pixels = gt_image 
             eval_pixels = gt_image 
             im = torch.clamp(im, 0.0, 1.0)
-            image_colors =im 
-            eval_colors =im 
+            image_colors =im.squeeze() 
+            eval_colors =im.squeeze() 
 
         canvas_list = [image_pixels, image_colors] #for display, don't do alpha blending.
 
@@ -531,7 +542,7 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
 
 
 
-def train(data_dir, exp, every_t):
+def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
     """Training script for the rose scene, specifically tailored from my custom dataset."""
     scene_name = data_dir.split("/")[-1]
     now = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
@@ -541,7 +552,7 @@ def train(data_dir, exp, every_t):
     plot_intervals = [1, 599, 1999, 6999, 9999] 
     strategy = DefaultStrategy()
     strategy.refine_stop_iter = 5000 #original code base only prunes before iteration 5000
-    params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
+    params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t, use_blender_mask= use_blender_mask)
     timesteps = list(range(0, len(images["r_1"]))) #assuming all cameras have the same number of timesteps
     num_timesteps = len(timesteps)
     print(f"training our method on {num_timesteps} timesteps")
@@ -564,12 +575,12 @@ def train(data_dir, exp, every_t):
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
-            loss, variables, info = get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strategy, strategy_state, i)
+            loss, variables, info = get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strategy, strategy_state, i, use_random_bkgd = use_random_bkgd)
             loss.backward()
             if is_initial_timestep:
                 strategy.step_post_backward(params, optimizer, strategy_state, i, info) #growing and pruning
             with torch.no_grad():
-                report_progress(params, variables, dataset, i, progress_bar)
+                report_progress(params, variables, dataset, i, progress_bar, use_random_bkgd = use_random_bkgd)
                 for opt in optimizer.values():
                     opt.step()
                     opt.zero_grad(set_to_none=True)
@@ -622,12 +633,23 @@ def train(data_dir, exp, every_t):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="./plant_data/rose")
+    parser.add_argument("--data_dir", "-d", default="./plant_data/rose_transparent")
     parser.add_argument("--name", "-n", type=str, default="exp1")
-    parser.add_argument("--every_t", "-t", type=int, default=10)
+    parser.add_argument("--every_t", "-t", type=int, default=1)
+    parser.add_argument("--use_blender_mask", "-m", type=bool, default=True) #set this to false when training on black bkgd
+    parser.add_argument("--use_random_bkgd", "-r", type=bool, default=True) #set this to true when training with transparent
+
     args = parser.parse_args()
     data_dir = args.data_dir
     exp_name = args.name
     every_t = args.every_t
-    train(data_dir, exp_name, every_t)
+    #NOTE: if use_blender_mask is set to true, we would only use it for eval to calc PSNR. For training, mask is not being used anyways.
+    use_blender_mask = args.use_blender_mask
+    use_random_bkgd = args.use_random_bkgd
+    print(f"sampling every {every_t} frames")
+    if use_blender_mask:
+        print("using blender mask")
+    else:
+        print("not using blender mask")
+    train(data_dir, exp_name, every_t, use_blender_mask, use_random_bkgd)
     torch.cuda.empty_cache()

@@ -30,6 +30,7 @@ import matplotlib.animation as animation
 from matplotlib.animation import FuncAnimation
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from scipy.spatial import ConvexHull
 
 def visualize_point_cloud(point_clouds, output_file="point_cloud.png", subsample_factor=1, 
                           point_size=20, figsize=(10, 8), view_angles=None, color='blue', zoom_factor=0.5):
@@ -609,6 +610,48 @@ def render_imgs(dataset, params, variables, val_path, timestep, iteration):
     
     return metrics, float_metrics, pred_images 
 
+
+def compute_bounding_box_mask(points, x_range=(-1, 1), y_range=(-1, 1), z_range=(-2, 2)):
+    """
+    Compute a mask for points within a specified 3D bounding box.
+    
+    Parameters:
+    points: Array of shape (T, N, 3) representing point trajectories
+            T = number of timesteps, N = number of points, 3 = XYZ coordinates
+    x_range: Tuple (xmin, xmax) for x-coordinate bounds
+    y_range: Tuple (ymin, ymax) for y-coordinate bounds
+    z_range: Tuple (zmin, zmax) for z-coordinate bounds
+    
+    Returns:
+    mask: Boolean array of shape (N,) where True indicates the point is within the box
+    """
+    xmin, xmax = x_range
+    ymin, ymax = y_range
+    zmin, zmax = z_range
+    
+    # Extract coordinates
+    x = points[:, :, 0]  # Shape (T, N)
+    y = points[:, :, 1]  # Shape (T, N)
+    z = points[:, :, 2]  # Shape (T, N)
+    
+    # Create mask for each dimension
+    x_mask = (x >= xmin) & (x <= xmax)  # Shape (T, N)
+    y_mask = (y >= ymin) & (y <= ymax)  # Shape (T, N)
+    z_mask = (z >= zmin) & (z <= zmax)  # Shape (T, N)
+    
+    # Combine masks - point must be within bounds for all dimensions
+    combined_mask = x_mask & y_mask & z_mask  # Shape (T, N)
+    
+    # If you want a point to be considered "in the box" if it's in the box at ANY timestep:
+    # final_mask = combined_mask.any(axis=0)  # Shape (N,)
+    
+    # Alternatively, if you want a point to be "in the box" only if it's in the box at ALL timesteps:
+    final_mask = combined_mask.all(axis=0)  # Shape (N,)
+    
+    return final_mask
+
+
+
 @torch.no_grad() 
 def render_eval(exp_path, data_dir, every_t):
     """Render eval stuff"""
@@ -678,24 +721,63 @@ def render_eval(exp_path, data_dir, every_t):
     with open(f"{val_path}/eval_metrics.json", "w") as f:
         json.dump(stats, f)
 
+    print("visualizing point cloud animation!")
     threshold = 0.3 
     opacity_t0 = params["opacities"][0] #take opacity at t=0 for pruning 
     above_threshold_mask = (torch.sigmoid(opacity_t0) > threshold) #(N)
     visible_points = params["means"][:, above_threshold_mask, :]
+    #TODO:Compute a bounding box
+    bbox_mask = compute_bounding_box_mask(visible_points)
+    visible_points = visible_points[: bbox_mask, :]
+    #xmin, xmax = (-2, 2), ymin, ymax = (-2, 2), zmin, zmax=(-2, 2)
     torch.save(visible_points, f"{exp_path}/point_cloud_trajectory.pt")
     # visualize_point_cloud(visible_points[0])
     animate_point_clouds(visible_points.cpu(), output_file=f"{exp_path}/point_cloud_animation.mp4",
                             is_reverse=True, t_subsample=1)
 
+
+@torch.no_grad() 
+def render_pc_traj(exp_path, data_dir, every_t):
+    """Render pc stuff"""
+    md_test = json.load(open(f"{data_dir}/transforms_test.json", 'r'))
+    variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md_test, every_t)
+    param_path = glob(f"{exp_path}/*.npz")[0]
+    param_dict = np.load(param_path) #each param is of shape (T, N, F)
+    params = {}
+    val_path = os.path.join(exp_path, "eval")
+    os.makedirs(val_path, exist_ok=True)
+
+    for k,v in param_dict.items():
+        params[k] = torch.tensor(v).to("cuda")
+    num_timesteps = params["means"].shape[0]
+
+    print("visualizing point cloud animation!")
+    threshold = 0.7 
+    opacity_t0 = params["opacities"][0] #take opacity at t=0 for pruning 
+    above_threshold_mask = (torch.sigmoid(opacity_t0) > threshold) #(N)
+    visible_points = params["means"][:, above_threshold_mask, :]
+    #TODO:Compute a bounding box
+    bbox_mask = compute_bounding_box_mask(visible_points)
+    visible_points = visible_points[:, bbox_mask, :]
+    for t in range(visible_points.shape[0]):
+        convex_hull = ConvexHull(visible_points[t].cpu().numpy())
+        print(convex_hull.volume)
+    #xmin, xmax = (-2, 2), ymin, ymax = (-2, 2), zmin, zmax=(-2, 2)
+    torch.save(visible_points, f"{exp_path}/point_cloud_trajectory.pt")
+    # visualize_point_cloud(visible_points[0])
+    # animate_point_clouds(visible_points.cpu(), output_file=f"{exp_path}/point_cloud_animation.mp4",
+    #                         is_reverse=True, t_subsample=1)
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="./plant_data/rose")
-    parser.add_argument("--exp_path", "-p", default="./output/exp1/rose_all_cams_15_timesteps")
-    parser.add_argument("--every_t", "-t", type=int, default=10) #for eval need to match the number of point clouds saved
+    parser.add_argument("--data_dir", "-d", default="./plant_data/rose_transparent")
+    parser.add_argument("--exp_path", "-p", default="./output/exp1/rose_baseline")
+    parser.add_argument("--every_t", "-t", type=int, default=1) #for eval need to match the number of point clouds saved
     args = parser.parse_args()
     data_dir = args.data_dir
     every_t = args.every_t
     exp_path = args.exp_path
-    render_eval(exp_path, data_dir, every_t)
+    # render_eval(exp_path, data_dir, every_t)
+    render_pc_traj(exp_path, data_dir, every_t)
     print("Done eval")
     torch.cuda.empty_cache()
