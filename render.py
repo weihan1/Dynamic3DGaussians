@@ -58,12 +58,11 @@ def get_dataset(t, images, cam_to_worlds_dict, intrinsics):
 
 
 
-def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=True, num_gaussians=100_000):
+def initialize_params_and_get_data(data_dir, md, every_t, is_reverse=False, num_gaussians=100_000):
     """
     Use this when training on custom plant dataset.
     It has "camera_angle_x" and "frames" as keys
     1. Load images
-    2. Initialize gaussian parameters
     """
     cam_to_worlds_dict = {} #we just need on cam to worlds per view
     images = {} #(N: T, H, W, C)
@@ -168,20 +167,6 @@ def rasterize_splats(
     return render_colors, render_alphas, info
 
 
-def save_gt_video(video_duration, video, cam_index, full_out_path, is_reverse=True):
-    """
-    Given an array of frames, and cam index, save that video to full_out_path
-    """
-    #no need to background blend
-    selected_video = video[cam_index]
-    selected_video = np.stack(selected_video, axis=0)
-    fps = len(selected_video)/video_duration
-    if is_reverse:
-        selected_video = np.flip(selected_video, axis=0)
-    imageio.mimwrite(full_out_path, (selected_video*255).astype(np.uint8), fps=fps)
-
-    
-
 @torch.no_grad()
 def render_imgs(dataset, params, variables, timestep):
     """
@@ -240,9 +225,6 @@ def render_imgs(dataset, params, variables, timestep):
     return pred_images 
 
 
-
-
-
 @torch.no_grad() 
 def render_eval(exp_path, data_dir, every_t, is_reverse):
     """Render eval stuff"""
@@ -257,8 +239,12 @@ def render_eval(exp_path, data_dir, every_t, is_reverse):
     test_path = os.path.join(exp_path, "test")
     os.makedirs(test_path, exist_ok=True)
 
+    #TODO: if is_reverse is set to true, you need to reverse these parameters
     for k,v in param_dict.items():
-        params[k] = torch.tensor(v).to("cuda")
+        if not is_reverse: #is_reverse is being set to False by default
+            params[k] = torch.tensor(v).flip(0).to("cuda") #(T,N,F)
+        else:
+            params[k] = torch.tensor(v).to("cuda")
     num_timesteps = params["means"].shape[0]
     render_img_frames = np.zeros((num_timesteps, len(images.keys()), 400, 400, 3))
     #Need to create the test camera folders
@@ -267,18 +253,17 @@ def render_eval(exp_path, data_dir, every_t, is_reverse):
         full_cam_path = os.path.join(test_path, cam_idx)
         os.makedirs(full_cam_path, exist_ok=True)
 
-    for t in range(num_timesteps):  
+    for t in tqdm(range(num_timesteps)):
         dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
         time_params = {k: v[t] for k,v in params.items()}
         pred_images = render_imgs(dataset, time_params, variables, t)
         render_img_frames[t] = pred_images.cpu().numpy()
-        for i, img in enumerate(pred_images):
+        for i, img in enumerate(pred_images): #loop over each camera
             full_cam_path = os.path.join(test_path, cam_indices_lst[i])
-            full_image_path = os.path.join(full_cam_path, f"{i:05d}.png")
+            full_image_path = os.path.join(full_cam_path, f"{t:05d}.png")
             imageio.imwrite(full_image_path, (img.cpu().numpy()*255).astype(np.uint8))
 
     fps = len(render_img_frames)/3
-    render_img_frames = np.flip(render_img_frames, axis=0)
     for j in range(len(dataset["camtoworld"].keys())):
         outpath = f"{test_path}/rendered_video_cam_{j}.mp4"
         imageio.mimwrite(outpath, (render_img_frames[:, j].squeeze()*255).astype(np.uint8), fps=fps)
