@@ -550,7 +550,7 @@ def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
     os.makedirs(exp_path, exist_ok=True)
     md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
     plot_intervals = [1, 599, 1999, 6999, 9999] 
-    strategy = DefaultStrategy()
+    strategy = DefaultStrategy(verbose=True)
     strategy.refine_stop_iter = 5000 #original code base only prunes before iteration 5000
     params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t, use_blender_mask= use_blender_mask)
     timesteps = list(range(0, len(images["r_1"]))) #assuming all cameras have the same number of timesteps
@@ -571,7 +571,7 @@ def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 30_000 if is_initial_timestep else 2000
+        num_iter_per_timestep = 30_000 if is_initial_timestep else 4000 
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
