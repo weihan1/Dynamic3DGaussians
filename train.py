@@ -571,7 +571,7 @@ def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 30_000 if is_initial_timestep else 4000 
+        num_iter_per_timestep = 30_000 if is_initial_timestep else 2000 
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.

@@ -179,7 +179,8 @@ def render_imgs(dataset, params, variables, timestep):
     all_camera_indices = list(dataset["camtoworld"])
     # elapsed_time = 0
     num_cameras = len(all_camera_indices)
-    h,w = dataset["image"]["r_0"].shape[0], dataset["image"]["r_0"].shape[1]
+    first_available_camera_idx = all_camera_indices[0]
+    h,w = dataset["image"][first_available_camera_idx].shape[0], dataset["image"][first_available_camera_idx].shape[1]
 
     pred_images = torch.zeros(num_cameras, h, w, 3)
     for i, camera_indx in enumerate(all_camera_indices):
@@ -226,20 +227,22 @@ def render_imgs(dataset, params, variables, timestep):
 
 
 @torch.no_grad() 
-def render_eval(exp_path, data_dir, every_t, is_reverse):
+def render_eval(exp_path, data_dir, every_t, is_reverse, split):
     """Render eval stuff"""
     #NOTE: Recall in dynamic3DGS, we freeze everything except ['opacities', 'scales']
-    md_test = json.load(open(f"{data_dir}/transforms_test.json", 'r'))
-    variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md_test, every_t, is_reverse=is_reverse)
+    md_path =  f"{data_dir}/transforms_{split}.json"
+    with open(md_path, "r") as f:
+        md = json.load(f)
+
+    variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t, is_reverse=is_reverse)
     param_path = glob(f"{exp_path}/*.npz")[0]
     param_dict = np.load(param_path) #each param is of shape (T, N, F)
     params = {}
 
-    #NOTE: we are only going to do it for the test folder and not the train folder nor the gt
-    test_path = os.path.join(exp_path, "test")
-    os.makedirs(test_path, exist_ok=True)
+    output_folder = os.path.join(exp_path, split)
+    os.makedirs(output_folder, exist_ok=True)
 
-    #TODO: if is_reverse is set to true, you need to reverse these parameters
+    #NOTE: if is_reverse is set to true, you need to reverse these parameters
     for k,v in param_dict.items():
         if not is_reverse: #is_reverse is being set to False by default
             params[k] = torch.tensor(v).flip(0).to("cuda") #(T,N,F)
@@ -247,10 +250,10 @@ def render_eval(exp_path, data_dir, every_t, is_reverse):
             params[k] = torch.tensor(v).to("cuda")
     num_timesteps = params["means"].shape[0]
     render_img_frames = np.zeros((num_timesteps, len(images.keys()), 400, 400, 3))
-    #Need to create the test camera folders
+    
     cam_indices_lst = list(images.keys())
     for cam_idx in cam_indices_lst:
-        full_cam_path = os.path.join(test_path, cam_idx)
+        full_cam_path = os.path.join(output_folder, cam_idx)
         os.makedirs(full_cam_path, exist_ok=True)
 
     for t in tqdm(range(num_timesteps)):
@@ -259,13 +262,13 @@ def render_eval(exp_path, data_dir, every_t, is_reverse):
         pred_images = render_imgs(dataset, time_params, variables, t)
         render_img_frames[t] = pred_images.cpu().numpy()
         for i, img in enumerate(pred_images): #loop over each camera
-            full_cam_path = os.path.join(test_path, cam_indices_lst[i])
+            full_cam_path = os.path.join(output_folder, cam_indices_lst[i])
             full_image_path = os.path.join(full_cam_path, f"{t:05d}.png")
             imageio.imwrite(full_image_path, (img.cpu().numpy()*255).astype(np.uint8))
 
     fps = len(render_img_frames)/3
     for j in range(len(dataset["camtoworld"].keys())):
-        outpath = f"{test_path}/rendered_video_cam_{j}.mp4"
+        outpath = f"{output_folder}/rendered_video_cam_{j}.mp4"
         imageio.mimwrite(outpath, (render_img_frames[:, j].squeeze()*255).astype(np.uint8), fps=fps)
 
 
@@ -276,11 +279,14 @@ if __name__ == "__main__":
     parser.add_argument("--exp_path", "-p", default="./output/exp1/rose_baseline")
     parser.add_argument("--every_t", "-t", type=int, default=1) #for eval need to match the number of point clouds saved
     parser.add_argument("--is_reverse", "-r", type=bool, default=False) #NOTE: the reason we set is reverse equal to False here is so we can have the normal growth of plant in rendered
+    parser.add_argument("--split", nargs="+", default=["train", "test"])
     args = parser.parse_args()
     data_dir = args.data_dir
     every_t = args.every_t
     exp_path = args.exp_path
     is_reverse = args.is_reverse
-    render_eval(exp_path, data_dir, every_t, is_reverse)
+    for split in args.split:
+        print(f"rendering {split}")
+        render_eval(exp_path, data_dir, every_t, is_reverse, split)
     print("Done eval")
     torch.cuda.empty_cache()
