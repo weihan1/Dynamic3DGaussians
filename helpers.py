@@ -7,7 +7,12 @@ from typing import NamedTuple
 from plyfile import PlyData, PlyElement
 import math
 from sklearn.neighbors import NearestNeighbors
-
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.animation as animation
+from matplotlib.cm import get_cmap
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
 
 """
 TODO: first use the gsplat rasterizer, and if it works, don't need to use the inria rasterizer.
@@ -224,3 +229,107 @@ def fetchPly(path):
     
     
     
+def animate_point_clouds(point_clouds, output_file="point_cloud_animation.mp4", fps=10, 
+                         point_size=20, figsize=(10, 8), view_angles=None, color='blue', is_reverse=True,
+                         t_subsample=1):
+    """
+    Animate a sequence of point clouds and save as a video.
+    
+    Parameters:
+    -----------
+    point_clouds : numpy.ndarray
+        Point clouds of shape (T, N, 3) where:
+        - T is the number of frames
+        - N is the number of points
+        - 3 represents the XYZ coordinates
+    output_file : str
+        Output filename for the video (mp4 format)
+    fps : int
+        Frames per second for the video
+    point_size : int
+        Size of points in the visualization
+    figsize : tuple
+        Figure size (width, height) in inches
+    view_angles : list or None
+        Initial view angles [elevation, azimuth] if specified
+    color : str or array
+        Color of the points
+    is_reverse: bool
+        whether or not the trajectory is reversed
+    subsample_rate: float 
+        subsampling rate for the tensor, between (0,1)
+    """
+    if isinstance(point_clouds, torch.Tensor):
+        point_clouds = point_clouds.cpu().numpy()
+    every_n = int(1/t_subsample)
+    point_clouds = point_clouds[::every_n,:,:]
+    # Get data dimensions
+    T, N, _ = point_clouds.shape
+    
+    if is_reverse:
+        point_clouds = np.flip(point_clouds, axis=0)
+     
+    # Create figure and 3D axes
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Initialize scatter plot
+    scatter = ax.scatter([], [], [], s=point_size, c=color, alpha=0.8)
+    
+    # Set axis labels
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+   
+    # Fixed limits for Blender scenes
+    ax.set_xlim([-2, 2])
+    ax.set_ylim([-2, 2])
+    ax.set_zlim([-2, 2])
+
+    # Set title
+    ax.set_title('Point Cloud Animation')
+    
+    # Set initial view angle if specified
+    if view_angles is not None:
+        ax.view_init(elev=view_angles[0], azim=view_angles[1])
+    
+    def update(frame):
+        """ Update function for each frame """
+        x, y, z = point_clouds[frame, :, 0], point_clouds[frame, :, 1], point_clouds[frame, :, 2]
+        
+        # Update scatter plot data
+        scatter._offsets3d = (x, y, z)
+        
+        # Update frame title correctly
+        ax.title.set_text(f'Point Cloud Animation - Frame {frame+1}/{T}')
+        return scatter,
+    
+    # Create animation
+    anim = FuncAnimation(
+        fig, update, frames=T, 
+        interval=1000/fps
+    )
+
+    # Fixed coordinate system settings
+    max_range = 2.0  # Fixed to match [-2,2] scene
+    center = np.array([-1, -3, 0])  # make the origin of the axes on the bottom left side
+    max_length = max_range * 0.4  # Length of coordinate axes
+    
+    # X axis - Red
+    ax.plot([center[0], center[0] + max_length], [center[1], center[1]], [center[2], center[2]], 'r-', linewidth=2)
+    ax.text(center[0] + max_length * 1.1, center[1], center[2], 'X', color='red')
+
+    # Y axis - Green
+    ax.plot([center[0], center[0]], [center[1], center[1] + max_length], [center[2], center[2]], 'g-', linewidth=2)
+    ax.text(center[0], center[1] + max_length * 1.1, center[2], 'Y', color='green')
+
+    # Z axis - Blue
+    ax.plot([center[0], center[0]], [center[1], center[1]], [center[2], center[2] + max_length], 'b-', linewidth=2)
+    ax.text(center[0], center[1], center[2] + max_length * 1.1, 'Z', color='blue')
+
+    # Save animation as MP4
+    writer = animation.FFMpegWriter(fps=fps)
+    anim.save(output_file, writer=writer)
+    print(f"Animation saved to {output_file}")
+    
+    plt.close()

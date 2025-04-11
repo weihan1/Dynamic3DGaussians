@@ -23,7 +23,7 @@ from helpers import l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_los
 from external import calc_psnr, build_rotation, densify, update_params_and_optimizer
 from argparse import ArgumentParser
 import imageio.v2 as imageio
-from helpers import knn
+from helpers import knn, animate_point_clouds
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -271,6 +271,15 @@ def render_eval(exp_path, data_dir, every_t, is_reverse, split):
         outpath = f"{output_folder}/rendered_video_cam_{j}.mp4"
         imageio.mimwrite(outpath, (render_img_frames[:, j].squeeze()*255).astype(np.uint8), fps=fps)
 
+    if split == "test":
+        threshold = 0.3 
+        opacity_t0 = params["opacities"][0] #take opacity at t=0 for pruning 
+        above_threshold_mask = (torch.sigmoid(opacity_t0) > threshold) #(N)
+        visible_points = params["means"][:, above_threshold_mask, :]
+        torch.save(visible_points, f"{output_folder}/point_cloud_trajectory.pt")
+        # visualize_point_cloud(visible_points[0])
+        animate_point_clouds(visible_points.cpu(), output_file=f"{output_folder}/point_cloud_animation.mp4",
+                                is_reverse=False, t_subsample=1)
 
 if __name__ == "__main__":
     """Use this script to render images in a standard format so we can run metrics"""
