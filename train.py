@@ -571,7 +571,7 @@ def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
-        num_iter_per_timestep = 30_000 if is_initial_timestep else 2000 
+        num_iter_per_timestep = 30_000 if is_initial_timestep else 4000
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(dataset) #randomly selects a camera and rasterize.
@@ -633,12 +633,13 @@ def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="./plant_data/rose_transparent")
+    parser.add_argument("--data_dir", "-d", default="")
     parser.add_argument("--name", "-n", type=str, default="exp1")
     parser.add_argument("--every_t", "-t", type=int, default=1)
     parser.add_argument("--use_blender_mask", "-m", type=bool, default=True) #set this to false when training on black bkgd
     parser.add_argument("--use_random_bkgd", "-r", type=bool, default=True) #set this to true when training with transparent
-
+    parser.add_argument("--num_iter_per_timestep", "-r", type=int, default=3000) #num iter per timestep except t=0
+    
     args = parser.parse_args()
     data_dir = args.data_dir
     exp_name = args.name
