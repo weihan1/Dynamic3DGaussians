@@ -284,8 +284,8 @@ def render_eval(exp_path, data_dir, every_t, is_reverse, split):
 if __name__ == "__main__":
     """Use this script to render images in a standard format so we can run metrics"""
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument("--data_dir", "-d", default="./plant_data/rose_transparent")
-    parser.add_argument("--exp_path", "-p", default="./output/exp1/rose_baseline")
+    parser.add_argument("--data_dir", "-d", default="")
+    parser.add_argument("--exp_path", "-p", default="")
     parser.add_argument("--every_t", "-t", type=int, default=1) #for eval need to match the number of point clouds saved
     parser.add_argument("--is_reverse", "-r", type=bool, default=False) #NOTE: the reason we set is reverse equal to False here is so we can have the normal growth of plant in rendered
     parser.add_argument("--split", nargs="+", default=["train", "test"])

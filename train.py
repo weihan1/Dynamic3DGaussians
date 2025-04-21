@@ -542,11 +542,11 @@ def render_imgs(dataset, params, variables, exp_path, timestep, iteration):
 
 
 
-def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
+def train(data_dir, every_t, use_blender_mask, use_random_bkgd):
     """Training script for the rose scene, specifically tailored from my custom dataset."""
     scene_name = data_dir.split("/")[-1]
     now = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
-    exp_path = f"./output/{exp}/{scene_name}_{now}"
+    exp_path = f"./output/Dynamic3DGS/{scene_name}"
     os.makedirs(exp_path, exist_ok=True)
     md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
     plot_intervals = [1, 599, 1999, 6999, 9999] 
@@ -634,14 +634,12 @@ def train(data_dir, exp, every_t, use_blender_mask, use_random_bkgd):
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--data_dir", "-d", default="")
-    parser.add_argument("--name", "-n", type=str, default="exp1")
     parser.add_argument("--every_t", "-t", type=int, default=1)
     parser.add_argument("--use_blender_mask", "-m", type=bool, default=True) #set this to false when training on black bkgd
     parser.add_argument("--use_random_bkgd", "-r", type=bool, default=True) #set this to true when training with transparent
     
     args = parser.parse_args()
     data_dir = args.data_dir
-    exp_name = args.name
     every_t = args.every_t
     #NOTE: if use_blender_mask is set to true, we would only use it for eval to calc PSNR. For training, mask is not being used anyways.
     use_blender_mask = args.use_blender_mask
@@ -651,5 +649,5 @@ if __name__ == "__main__":
         print("using blender mask")
     else:
         print("not using blender mask")
-    train(data_dir, exp_name, every_t, use_blender_mask, use_random_bkgd)
+    train(data_dir, every_t, use_blender_mask, use_random_bkgd)
     torch.cuda.empty_cache()
