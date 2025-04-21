@@ -287,8 +287,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", "-d", default="")
     parser.add_argument("--exp_path", "-p", default="")
     parser.add_argument("--every_t", "-t", type=int, default=1) #for eval need to match the number of point clouds saved
-    parser.add_argument("--is_reverse", "-r", type=bool, default=False) #NOTE: the reason we set is reverse equal to False here is so we can have the normal growth of plant in rendered
-    parser.add_argument("--split", nargs="+", default=["train", "test"])
+    parser.add_argument("--is_reverse", "-r", type=bool, default=True) #NOTE: set true so we visualize "ungrowth" compared to growth.
+    parser.add_argument("--split", nargs="+", default=["test"]) #dont render train for now.
     args = parser.parse_args()
     data_dir = args.data_dir
     every_t = args.every_t
