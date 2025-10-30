@@ -13,12 +13,123 @@ import matplotlib.animation as animation
 from matplotlib.cm import get_cmap
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
+from cmocean import cm
 
 """
 TODO: first use the gsplat rasterizer, and if it works, don't need to use the inria rasterizer.
 """
 
 
+def world_to_cam_means(
+    means,
+    viewmats
+):
+    batch_dims = means.shape[:-2]
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    assert means.shape == batch_dims + (N, 3), means.shape
+    assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
+
+    R = viewmats[..., :3, :3]  # [..., C, 3, 3]
+    t = viewmats[..., :3, 3]  # [..., C, 3]
+    means_c = (
+        torch.einsum("...cij,...nj->...cni", R, means) + t[..., None, :]
+    )  # [..., C, N, 3]
+    return means_c
+
+    
+def calculate_global_depth_range(point_clouds, center_position, view_angles, min_vals, max_vals):
+    """Calculate global depth range for consistent coloring"""
+    
+    # Calculate depth reference point (same logic as in your functions)
+    if view_angles is not None:
+        elev, azim = view_angles
+        elev_rad = np.radians(elev)
+        azim_rad = np.radians(azim)
+        camera_distance = np.max(max_vals - min_vals) * 2
+        camera_x = camera_distance * np.cos(elev_rad) * np.cos(azim_rad)
+        camera_y = camera_distance * np.cos(elev_rad) * np.sin(azim_rad)
+        camera_z = camera_distance * np.sin(elev_rad)
+        depth_reference_point = np.array([camera_x, camera_y, camera_z])
+    else:
+        depth_reference_point = np.array([
+            (min_vals[0] + max_vals[0]) / 2,
+            (min_vals[1] + max_vals[1]) / 2,
+            max_vals[2] + (max_vals[2] - min_vals[2])
+        ])
+    
+    # Calculate depths for all frames
+    all_depths = []
+    
+    # Handle both list and array inputs
+    if isinstance(point_clouds, list):
+        frames = point_clouds
+    else:
+        frames = [point_clouds[i] for i in range(point_clouds.shape[0])]
+    
+    for frame in frames:
+        # Convert to numpy if needed
+        if isinstance(frame, torch.Tensor):
+            frame_np = frame.cpu().numpy()
+        else:
+            frame_np = frame
+            
+        # Apply centering
+        if center_position is not None:
+            frame_np = frame_np - np.array(center_position)
+            
+        # Calculate depths for this frame
+        depths = np.sqrt(
+            (frame_np[:, 0] - depth_reference_point[0])**2 +
+            (frame_np[:, 1] - depth_reference_point[1])**2 +
+            (frame_np[:, 2] - depth_reference_point[2])**2
+        )
+        all_depths.extend(depths)
+    
+    global_depth_min = np.min(all_depths)
+    global_depth_max = np.max(all_depths)
+    
+    return global_depth_min, global_depth_max, depth_reference_point
+    
+def pers_proj_means(
+    means,  # [..., C, N, 3]
+    Ks ,  # [..., C, 3, 3]
+    width: int,
+    height: int,
+):
+    """PyTorch implementation of perspective projection for 3D Gaussians."""
+    batch_dims = means.shape[:-3]
+    C, N = means.shape[-3:-1]
+    assert means.shape == batch_dims + (C, N, 3), means.shape
+    assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
+    
+    tx, ty, tz = torch.unbind(means, dim=-1)  # [..., C, N]
+    
+    # Extract intrinsic parameters
+    fx = Ks[..., 0, 0, None]  # [..., C, 1]
+    fy = Ks[..., 1, 1, None]  # [..., C, 1]
+    cx = Ks[..., 0, 2, None]  # [..., C, 1]
+    cy = Ks[..., 1, 2, None]  # [..., C, 1]
+    
+    # Calculate field of view limits
+    tan_fovx = 0.5 * width / fx  # [..., C, 1]
+    tan_fovy = 0.5 * height / fy  # [..., C, 1]
+    lim_x_pos = (width - cx) / fx + 0.3 * tan_fovx
+    lim_x_neg = cx / fx + 0.3 * tan_fovx
+    lim_y_pos = (height - cy) / fy + 0.3 * tan_fovy
+    lim_y_neg = cy / fy + 0.3 * tan_fovy
+    
+    # Clamp to avoid extreme projections
+    tx = tz * torch.clamp(tx / tz, min=-lim_x_neg, max=lim_x_pos)
+    ty = tz * torch.clamp(ty / tz, min=-lim_y_neg, max=lim_y_pos)
+    
+    # Project to 2D
+    means2d = torch.einsum(
+        "...ij,...nj->...ni", Ks[..., :2, :3], torch.stack([tx, ty, tz], dim=-1)
+    )  # [..., C, N, 2]
+    means2d = means2d / tz[..., None]  # [..., C, N, 2]
+    
+    return means2d
 
 # def setup_camera(w, h, k, w2c, near=0.01, far=100):
 #     fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
@@ -229,19 +340,168 @@ def fetchPly(path):
     
     
     
-def animate_point_clouds(point_clouds, output_file="point_cloud_animation.mp4", fps=10, 
-                         point_size=20, figsize=(10, 8), view_angles=None, color='blue', is_reverse=True,
-                         t_subsample=1):
+def animate_point_clouds(
+    point_clouds,
+    output_file="point_cloud_animation.mp4",
+    center_position=None,
+    fps=10,
+    point_size=20,
+    figsize=(6, 6),
+    view_angles=None,
+    color='blue',
+    is_reverse=True,
+    t_subsample=1,
+    zoom_factor=0.5,
+    flip_x=False,
+    flip_y=False,
+    flip_z=False,
+    use_z_coloring=True,
+    use_depth_coloring=False,
+    colormap="thermal",
+    depth_reference_point=None,
+    min_vals=None,
+    max_vals=None,
+    global_depth_min=None,
+    global_depth_max=None
+):
+    """
+    Animate point clouds with optional depth or Z coloring.
+    """
+
+    if isinstance(point_clouds, torch.Tensor):
+        point_clouds = point_clouds.cpu().numpy()
+    
+    every_n = int(1/t_subsample)
+    point_clouds = point_clouds[::every_n, :, :]
+    
+    # Get data dimensions
+    T, N, _ = point_clouds.shape
+    
+    # Center point cloud if needed
+    if center_position is not None:
+        center_position = np.array(center_position)
+        point_clouds = point_clouds - center_position
+
+    if is_reverse:
+        point_clouds = np.flip(point_clouds, axis=0)
+    colormap = getattr(cm, colormap) 
+    # Create figure + 3D axes
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_axis_off()
+    ax.grid(False)
+    
+    # Remove 3D panes
+    for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+        axis.pane.fill = False
+        axis.pane.set_edgecolor('none')
+
+    # First frame
+    first_frame = point_clouds[0]
+    x0, y0, z0 = first_frame[:, 0], first_frame[:, 1], first_frame[:, 2]
+
+    # Handle coloring
+    if use_z_coloring:
+        scatter = ax.scatter(x0, y0, z0, s=point_size, c=-z0, cmap=colormap, alpha=0.8)
+
+    elif use_depth_coloring:
+        if depth_reference_point is None:
+            if (min_vals is not None) and (max_vals is not None):
+                if view_angles is not None:
+                    elev, azim = view_angles
+                    elev_rad = np.radians(elev)
+                    azim_rad = np.radians(azim)
+                    camera_distance = np.max(max_vals - min_vals) * 2
+                    camera_x = camera_distance * np.cos(elev_rad) * np.cos(azim_rad)
+                    camera_y = camera_distance * np.cos(elev_rad) * np.sin(azim_rad)
+                    camera_z = camera_distance * np.sin(elev_rad)
+                    depth_reference_point = np.array([camera_x, camera_y, camera_z])
+                else:
+                    depth_reference_point = np.array([
+                        (min_vals[0] + max_vals[0]) / 2,
+                        (min_vals[1] + max_vals[1]) / 2,
+                        max_vals[2] + (max_vals[2] - min_vals[2])
+                    ])
+            else:
+                raise ValueError("min_vals and max_vals must be provided for depth coloring if no reference point is given")
+
+        depths = np.sqrt(
+            (x0 - depth_reference_point[0])**2 +
+            (y0 - depth_reference_point[1])**2 +
+            (z0 - depth_reference_point[2])**2
+        )
+        
+        # ✅ ADDED: Global depth range support for consistent coloring
+        if global_depth_min is not None and global_depth_max is not None:
+            scatter = ax.scatter(x0, y0, z0, s=point_size, c=depths, cmap=colormap, 
+                               vmin=global_depth_min, vmax=global_depth_max, alpha=0.8)
+        else:
+            scatter = ax.scatter(x0, y0, z0, s=point_size, c=depths, cmap=colormap, alpha=0.8)
+
+    else:
+        scatter = ax.scatter(x0, y0, z0, s=point_size, c=color, alpha=0.8)
+
+    # Axis limits
+    ax.set_xlim([-0.12, 0.12])
+    ax.set_ylim([-0.12, 0.12])
+    ax.set_zlim([-0.07, 0.15])
+    
+    if flip_x:
+        ax.invert_xaxis()
+    if flip_y: 
+        ax.invert_yaxis()
+    if flip_z: 
+        ax.invert_zaxis()
+    
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.set_title('Point Cloud Animation')
+
+    # Initial view
+    if view_angles is not None:
+        ax.view_init(elev=view_angles[0], azim=view_angles[1])
+
+    def update(frame):
+        x, y, z = point_clouds[frame, :, 0], point_clouds[frame, :, 1], point_clouds[frame, :, 2]
+
+        if use_z_coloring:
+            scatter._offsets3d = (x, y, z)
+            scatter.set_array(-z)
+
+        elif use_depth_coloring:
+            depths = np.sqrt(
+                (x - depth_reference_point[0])**2 +
+                (y - depth_reference_point[1])**2 +
+                (z - depth_reference_point[2])**2
+            )
+            scatter._offsets3d = (x, y, z)
+            scatter.set_array(depths)
+            
+            # ✅ ADDED: Maintain consistent color scaling in animation updates
+            if global_depth_min is not None and global_depth_max is not None:
+                scatter.set_clim(vmin=global_depth_min, vmax=global_depth_max)
+
+        else:
+            scatter._offsets3d = (x, y, z)
+
+        ax.title.set_text(f'Point Cloud Animation - Frame {frame+1}/{T}')
+        return scatter,
+
+    # Animate
+    anim = FuncAnimation(fig, update, frames=T, interval=1000/fps)
+    writer = animation.FFMpegWriter(fps=fps)
+    anim.save(output_file, writer=writer)
+    print(f"Animation saved to {output_file}")
+    plt.close()
+
+def animate_point_clouds_lst(point_clouds, output_file="point_cloud_animation.mp4", fps=10, 
+                         point_size=20, figsize=(10, 8), view_angles=None, color='blue', is_reverse=False,
+                         t_subsample=1, zoom_factor=0.5):
     """
     Animate a sequence of point clouds and save as a video.
     
     Parameters:
     -----------
-    point_clouds : numpy.ndarray
-        Point clouds of shape (T, N, 3) where:
-        - T is the number of frames
-        - N is the number of points
-        - 3 represents the XYZ coordinates
+    point_clouds : list of point clouds
     output_file : str
         Output filename for the video (mp4 format)
     fps : int
@@ -259,15 +519,34 @@ def animate_point_clouds(point_clouds, output_file="point_cloud_animation.mp4", 
     subsample_rate: float 
         subsampling rate for the tensor, between (0,1)
     """
-    if isinstance(point_clouds, torch.Tensor):
-        point_clouds = point_clouds.cpu().numpy()
-    every_n = int(1/t_subsample)
-    point_clouds = point_clouds[::every_n,:,:]
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import matplotlib.animation as animation
+    from matplotlib.cm import get_cmap
+    from matplotlib.animation import FuncAnimation
+    from mpl_toolkits.mplot3d import Axes3D
+
+    lst_of_pc_numpy = []
+    for pc in point_clouds:
+        if isinstance(pc, torch.Tensor):
+            lst_of_pc_numpy.append(pc.cpu().numpy())
+        else:
+            lst_of_pc_numpy.append(pc)
+
+    point_clouds = lst_of_pc_numpy
+    # every_n = int(1/t_subsample)
+    # point_clouds = point_clouds[::every_n,:,:]
     # Get data dimensions
-    T, N, _ = point_clouds.shape
+    # T, N, _ = point_clouds.shape
+    first_frame = point_clouds[0]  # Shape: (N, 3)
+    min_vals = first_frame.min(axis=0)
+    max_vals = first_frame.max(axis=0)
+    max_range = max(max_vals - min_vals)
+    center = (min_vals + max_vals) / 2
+    T = len(point_clouds)
     
     if is_reverse:
-        point_clouds = np.flip(point_clouds, axis=0)
+        point_clouds =  point_clouds[::-1]
      
     # Create figure and 3D axes
     fig = plt.figure(figsize=figsize)
@@ -282,9 +561,9 @@ def animate_point_clouds(point_clouds, output_file="point_cloud_animation.mp4", 
     ax.set_zlabel('Z')
    
     # Fixed limits for Blender scenes
-    ax.set_xlim([-2, 2])
-    ax.set_ylim([-2, 2])
-    ax.set_zlim([-2, 2])
+    ax.set_xlim([center[0] - max_range * zoom_factor, center[0] + max_range * zoom_factor])
+    ax.set_ylim([center[1] - max_range * zoom_factor, center[1] + max_range * zoom_factor])
+    ax.set_zlim([center[2] - max_range * zoom_factor, center[2] + max_range * zoom_factor])
 
     # Set title
     ax.set_title('Point Cloud Animation')
@@ -295,7 +574,7 @@ def animate_point_clouds(point_clouds, output_file="point_cloud_animation.mp4", 
     
     def update(frame):
         """ Update function for each frame """
-        x, y, z = point_clouds[frame, :, 0], point_clouds[frame, :, 1], point_clouds[frame, :, 2]
+        x, y, z = point_clouds[frame][:, 0], point_clouds[frame][:, 1], point_clouds[frame][:, 2]
         
         # Update scatter plot data
         scatter._offsets3d = (x, y, z)
