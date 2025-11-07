@@ -242,7 +242,8 @@ class DynamicParser:
         test_every: int = 8,
         align_timesteps: bool = False,
         dates: list= ["08-07-2025"],
-        use_dense: bool =False
+        use_dense: bool =False,
+        apply_mask:bool=True,
     ):
         
         self.data_dir = data_dir
@@ -251,6 +252,7 @@ class DynamicParser:
         self.test_every = test_every
         self.align_timesteps = align_timesteps
         self.use_dense = use_dense
+        self.apply_mask = apply_mask
 
         # Initialize storage for all timesteps
         self.timestep_data = [] #this stores per-timestep data
@@ -259,9 +261,6 @@ class DynamicParser:
         assert dates is not None, "please specify dates"
         assert all(dates[i] >= dates[i+1] for i in range(len(dates)-1)), "Dates not in decreasing order"
         #Make sure here u go from latest date to earliest date
-        # data_dirs = ["08-03-2025", "08-02-2025", "08-01-2025"]
-        # data_dirs = ["08-08-2025", "08-07-2025"]
-        # data_dirs = ["08-07-2025"]
         self.num_timesteps = len(dates)
         print(f"[DynamicParser] Processing {self.num_timesteps} timesteps...")
 
@@ -480,8 +479,13 @@ class DynamicParser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images_still")
         image_dir = os.path.join(data_dir, "images_still" + image_dir_suffix)
-        masks_dir = os.path.join(data_dir, "masks")
-        resized_mask_dir = masks_dir + image_dir_suffix+"_png"
+        masks_dir = os.path.join(data_dir, "masks_bg")
+
+        if self.factor > 1:
+            resized_mask_dir = masks_dir + image_dir_suffix+"_png"
+        else:
+            resized_mask_dir = masks_dir 
+
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -707,6 +711,7 @@ class Dynamic_Dataset():
         self.time_normalize_factor = time_normalize_factor
         self.first_mesh_path = ""
         self.return_mask = return_mask
+        self.apply_mask = self.parser.apply_mask
         
         print(f"Normalizing our time from [0, {time_normalize_factor}]")
         
@@ -766,6 +771,9 @@ class Dynamic_Dataset():
                     image = image[y : y + h, x : x + w]
                     inverted_mask = inverted_mask[y : y + h, x : x + w]
                 
+                if self.apply_mask:
+                    image = image * inverted_mask[..., np.newaxis]
+
                 images[image_id] = image
                 masks[image_id] = inverted_mask
                 poses[image_id] = timestep_data['camtoworlds'][i]
@@ -824,12 +832,12 @@ class Dynamic_Dataset():
         Define a "NVS" camera which is not in the union of any cameras of any timesteps
         """
         self.available_timesteps = list(range(self.parser.num_timesteps))
-        
+        test_every  = 8
         if self.split == "train":
             # Remove first camera from each timestep for training
             for timestep in self.available_timesteps:
                 if len(self.timestep_images[timestep]) > 0:
-                    test_image_ids = list(self.timestep_images[timestep].keys())[-1:]
+                    test_image_ids = list(self.timestep_images[timestep].keys())[::test_every]
                     
                     # Remove from training data
                     for image_id in test_image_ids:
@@ -846,8 +854,7 @@ class Dynamic_Dataset():
                 test_image_paths = []
                 if len(self.timestep_images[timestep]) > 0:
                     # Get every 10th image_id (already in chronological order)
-                    #TODO: dont forget to change this
-                    test_image_ids = list(self.timestep_images[timestep].keys())[-1:]
+                    test_image_ids = list(self.timestep_images[timestep].keys())[::test_every]
                     for image_id in test_image_ids:
                         test_image_paths.append(self.timestep_image_paths[timestep][image_id])
                     print(f"the test image names for timestep {timestep} are {test_image_paths}") 

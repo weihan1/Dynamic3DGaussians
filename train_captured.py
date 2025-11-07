@@ -265,6 +265,7 @@ def get_loss(params, curr_data, variables, is_initial_timestep, optimizer, strat
     else:
         losses['im'] = l1_loss_v1(im.squeeze(), gt_image.squeeze())
 
+    #NOTE: turn these off 
     if not is_initial_timestep:
         is_fg = (params['masks'][:, 0] > 0.5).detach()
         fg_pts = rendervar['means'][is_fg]
@@ -344,7 +345,7 @@ def initialize_post_first_timestep(params, variables, optimizer, num_knn=20):
     return variables
 
 
-def train_captured(data_dir, every_t, dates, learn_masks):
+def train_captured(data_dir , dates, learn_masks, apply_mask):
     """Training script for the rose scene, specifically tailored from my custom dataset."""
     scene_name = data_dir.split("/")[-1]
     now = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
@@ -352,6 +353,7 @@ def train_captured(data_dir, every_t, dates, learn_masks):
     os.makedirs(exp_path, exist_ok=True)
     # md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
     # params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
+    train_indices = torch.arange(0, len(dates))/(len(dates)-1)
     from captured_data_utils import DynamicParser, Dynamic_Dataset, initialize_params_captured, InfiniteNeuralODEDataSampler, SingleTimeDataset
     parser = DynamicParser(
         data_dir=data_dir,
@@ -360,7 +362,8 @@ def train_captured(data_dir, every_t, dates, learn_masks):
         test_every=8,
         align_timesteps = False,
         dates =dates,
-        use_dense =False
+        use_dense =False,
+        apply_mask=apply_mask,
     )
 
     #This loads all the data and stores it in a dict
@@ -398,6 +401,7 @@ def train_captured(data_dir, every_t, dates, learn_masks):
     timesteps = list(range(0, len(dates))) #assuming all cameras have the same number of timesteps
     num_timesteps = len(timesteps)
     print(f"training our method on {num_timesteps} timesteps")
+    print(f"the training times are {train_indices}")
     optimizer = initialize_optimizer(params, variables)
 
     # Do the strategy stuff here
@@ -552,23 +556,23 @@ def train_captured(data_dir, every_t, dates, learn_masks):
 
     with open(f"{exp_path}/cfg.txt", "w") as f:
         f.write(f"data_dir: {data_dir}\n")      # Write data_dir with a newline
-        f.write(f"every_t: {every_t}\n")        # Write every_t with a newline
         
     save_params(output_params, exp_path)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--data_dir", "-d", default="")
-    parser.add_argument("--every_t", "-t", type=int, default=1)
     parser.add_argument("--subsample_factor", "-s", type=int, default=1)
+    parser.add_argument("--apply_mask", action="store_true")
     
     args = parser.parse_args()
     data_dir = args.data_dir
-    every_t = args.every_t
     learn_masks =True
     dates = sorted([f for f in os.listdir(data_dir) if f.startswith("timelapse")])[::-1] #NOTE: very important to invert the list, because we compute the point clouds of fully_grown
-    print(f"sampling every {every_t} frames")
-    train_captured(data_dir, every_t, dates, learn_masks)
+    if args.subsample_factor > 1:
+        print(f"subsampling the timesteps with factor of  {args.subsample_factor}")
+        dates = dates[::args.subsample_factor]
+    train_captured(data_dir, dates, learn_masks, args.apply_mask)
     torch.cuda.empty_cache()
 
 

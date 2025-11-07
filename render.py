@@ -35,6 +35,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import cv2
 import seaborn as sns
 from cmocean import cm
+from interpolator import GaussianInterpolator
 
 def visualize_point_cloud(
     point_clouds,
@@ -245,7 +246,7 @@ def get_dataset(t, images, cam_to_worlds_dict, intrinsics):
 
 
 
-def initialize_params_and_get_data(data_dir, md, every_t, num_gaussians=100_000):
+def initialize_params_and_get_data(data_dir, md, every_t, render_white=False,num_gaussians=100_000):
     """
     Use this when training on custom plant dataset.
     It has "camera_angle_x" and "frames" as keys
@@ -253,6 +254,7 @@ def initialize_params_and_get_data(data_dir, md, every_t, num_gaussians=100_000)
     """
     cam_to_worlds_dict = {} #we just need on cam to worlds per view
     images = {} #(N: T, H, W, C)
+    alpha_masks = {}
     image_ids_dict = {} 
     images_ids_lst = [] #only used for counting
     progress_bar = tqdm(total=len(md["frames"]), desc=f"Loading the data from {data_dir}")
@@ -264,14 +266,18 @@ def initialize_params_and_get_data(data_dir, md, every_t, num_gaussians=100_000)
         norm_img = img/255.0
         norm_img[norm_img<0.1] = 0 #get rid of some background noise from blender scenes
         norm_img = np.clip(norm_img, 0, 1) 
+        alpha_mask = norm_img[..., 3:4] #(h,w,1)
         if camera_id not in images:
             images[camera_id] = []
             images[camera_id].append(norm_img)
             image_ids_dict[camera_id] = []
             image_ids_dict[camera_id].append(image_ids)
+            alpha_masks[camera_id] = []
+            alpha_masks[camera_id].append(alpha_mask)
         else:
             images[camera_id].append(norm_img)
             image_ids_dict[camera_id].append(image_ids)
+            alpha_masks[camera_id].append(alpha_mask)
 
         c2w = torch.tensor(frame["transform_matrix"])
         c2w[0:3, 1:3] *= -1  # Convert from OpenGL to OpenCV
@@ -303,7 +309,10 @@ def initialize_params_and_get_data(data_dir, md, every_t, num_gaussians=100_000)
     variables = {'scene_scale': scene_scale,
                  'fixed_bkgd': torch.zeros(1, 3, device="cuda")} #fixed black background we use for rendering eval for instance.
 
-    return variables, images, cam_to_worlds_dict, intrinsics
+    if render_white:
+        return variables, images, cam_to_worlds_dict, intrinsics, alpha_masks
+    else:
+        return variables, images, cam_to_worlds_dict, intrinsics
 
 
 def rasterize_splats(
@@ -703,6 +712,362 @@ def render_eval(exp_path, data_dir, every_t, split):
             )
 
 
+@torch.no_grad() 
+def render_eval_interp(exp_path, data_dir, every_t, split, cached_params_path=None, render_white=False):
+    """Render eval stuff"""
+    md_path =  f"{data_dir}/transforms_{split}.json"
+    with open(md_path, "r") as f:
+        md = json.load(f)
+
+    #use train_md to get the times
+    train_path =  f"{data_dir}/transforms_train.json"
+    with open(train_path, "r") as f:
+        train_md = json.load(f)
+
+    #collect all timesteps for the first view
+    training_times = []
+    for frame in train_md["frames"]:
+        if frame["time"] == 1.0:
+            training_times.append(frame["time"])
+            break
+        else:
+            training_times.append(frame["time"])
+
+    variables, images, cam_to_worlds_dict, intrinsics, alpha_masks = initialize_params_and_get_data(data_dir, md, every_t, render_white)
+    param_path = glob(f"{exp_path}/*.npz")[0]
+    param_dict = np.load(param_path) #each param is of shape (T, N, F)
+    original_params = {}
+
+    if render_white:
+        output_folder = os.path.join(exp_path, split+"_white")
+    else:
+        output_folder = os.path.join(exp_path, split)
+        os.makedirs(output_folder, exist_ok=True)
+
+    for k,v in param_dict.items():
+        original_params[k] = torch.tensor(v).to("cuda")
+
+    N =  original_params["means"].shape[1]
+    # trained_timesteps = len(training_times)
+    gaussians_dict = {}
+    for i,t in enumerate(training_times):
+        gaussians_dict[t] = {
+            "means": original_params["means"][i].cpu(),
+            "quaternions": original_params["quats"][i].cpu(),
+            "colors": original_params["rgbs"][i].cpu(),
+        }
+    interpolator = GaussianInterpolator(
+        trained_timesteps=training_times,
+        total_timesteps=70,
+        degree=3  # Cubic interpolation
+    )
+    if cached_params_path:
+        cached_params = torch.load(cached_params_path)
+        params = cached_params
+    else:
+        cached_params = None 
+
+
+    # Interpolate all parameters
+    if not cached_params:
+        all_gaussians = interpolator.interpolate_all(gaussians_dict)
+        # Stack all timesteps (assuming they're sorted)
+        sorted_timesteps = sorted(all_gaussians.keys())
+        means = torch.stack([torch.from_numpy(all_gaussians[t]["means"]) for t in sorted_timesteps]).to("cuda")
+        quats = torch.stack([torch.from_numpy(all_gaussians[t]["quaternions"]) for t in sorted_timesteps]).to("cuda")
+        colors = torch.stack([torch.from_numpy(all_gaussians[t]["colors"]) for t in sorted_timesteps]).to("cuda")
+
+        params = {
+            "means": means.to(torch.float32),
+            "quats": quats.to(torch.float32),
+            "rgbs": colors.to(torch.float32),
+            "scales": original_params["scales"][0:1].expand(70, -1, -1),
+            "opacities": original_params["opacities"][0:1].expand(70, -1)
+        }
+        torch.save(params, os.path.join(exp_path, "gaussian_params.pt"))
+    else:
+        params = cached_params
+    num_timesteps = params["means"].shape[0]
+    render_img_frames = np.zeros((num_timesteps, len(images.keys()), 400, 400, 3))
+    
+    cam_indices_lst = list(images.keys())
+    for cam_idx in cam_indices_lst:
+        full_cam_path = os.path.join(output_folder, cam_idx)
+        os.makedirs(full_cam_path, exist_ok=True)
+
+    gt_tracks_path = None
+    scene = None
+    gt_idxs_viz_pc = None
+    render_tracks = False if render_white else True
+    if split == "test":
+        # Determine scene name
+        scene_names = ["plant_1", "plant_2", "plant_3", "plant_4", "plant_5", 
+                      "rose", "lily", "tulip", "clematis", "peony"]
+        for scene_name in scene_names:
+            if scene_name in data_dir:
+                scene = scene_name
+                break
+        
+        gt_tracks_path = os.path.join(data_dir, "meshes", f"relevant_{scene}_meshes", "trajectory_frames.npz")
+        if os.path.exists(gt_tracks_path):
+            gt_tracks = np.load(gt_tracks_path)
+            gt_t0_all = gt_tracks["frame_0000"]  # (N,3)
+            
+            # Setup for point cloud visualization
+
+    #Create all folders/subfolders
+    if render_tracks and gt_tracks_path and os.path.exists(gt_tracks_path):
+        tracks_output_folder = os.path.join(output_folder, "tracks")
+        os.makedirs(tracks_output_folder, exist_ok=True)
+        
+        # Track visualization parameters
+        if "plant" not in scene:
+            subsample_factor_tracks = 15 #prevent overcrowding (10k points is good)
+        else:
+            subsample_factor_tracks = 1 #the plants scene have fewer mesh vertices so no need to subsample
+        gt_t0 = gt_t0_all[::subsample_factor_tracks] #make flows less crowded
+        opacity_threshold_flow = 0.3
+        tracking_window = 5
+        arrow_thickness = 2
+        flow_skip = 1
+        show_only_visible = True
+        fade_strength = 0.8
+        min_alpha = 0.1
+        
+        print(f"GT tracks has {gt_t0.shape[0]} points")
+        
+        #Using the same gt_idxs
+        camera_track_data = {}
+        gt_idxs = find_closest_gauss(gt_t0, params["means"][0, :, :3].cpu().numpy())
+        if show_only_visible:
+            opacities_idxs = torch.sigmoid(params["opacities"][0, gt_idxs]).cpu()
+            gt_idxs = gt_idxs[opacities_idxs > opacity_threshold_flow]
+        n_gaussians = gt_idxs.shape[0]
+        cmap = plt.cm.get_cmap("jet") #following tracking everything
+        colors = []
+        for i in range(n_gaussians):
+            color = cmap(i / n_gaussians)[:3]  # Get RGB, ignore alpha
+            colors.append((int(color[0]*255), int(color[1]*255), int(color[2]*255)))
+
+        # Initialize tracking variables per camera
+        for cam_idx in cam_indices_lst:
+            camera_track_data[cam_idx] = {
+                'gt_idxs': gt_idxs,
+                'all_trajs': None,
+                'all_times': None,
+                'colors': colors,
+                'track_imgs': [],
+                'track_path': os.path.join(tracks_output_folder, cam_idx)
+            }
+            os.makedirs(camera_track_data[cam_idx]['track_path'], exist_ok=True)
+
+    #main rendering loop
+    for t in tqdm(range(num_timesteps)):
+        dataset = get_dataset(t, images, cam_to_worlds_dict, intrinsics) #getting all cameras for time t
+        time_params = {k: v[t] for k,v in params.items()}
+        pred_images = render_imgs(dataset, time_params, variables, t)
+        render_img_frames[t] = pred_images.cpu().numpy()
+        for i, img in enumerate(pred_images): #loop over each camera
+            full_cam_path = os.path.join(output_folder, cam_indices_lst[i])
+            alpha_mask_i = alpha_masks[f"r_{i}"][t]
+            full_image_path = os.path.join(full_cam_path, f"{t:05d}.png")
+            if alpha_mask_i.ndim == 2:
+                alpha_mask_i = alpha_mask_i.unsqueeze(-1)  # Add channel dimension
+            if render_white:
+                background = torch.ones_like(img)
+            else:
+                background = torch.zeros_like(img) 
+            composited_img = img * alpha_mask_i + background* (1 - alpha_mask_i)
+            imageio.imwrite(full_image_path, (composited_img.cpu().numpy()*255).astype(np.uint8))
+
+        if render_tracks and gt_tracks_path and os.path.exists(gt_tracks_path):
+            current_means3d = params["means"][t, :, :3]  # (N, 3)
+            
+            for i, cam_idx in enumerate(cam_indices_lst):
+                cam_data = camera_track_data[cam_idx]
+                
+                # Get current rendering
+                current_rendering = (pred_images[i].cpu().numpy() * 255).astype(np.uint8).copy()
+                
+                # Initialize gt_idxs for this camera if not done
+                
+                # Get current camera viewmat
+                current_c2w = dataset["camtoworld"][cam_idx]
+                current_viewmat = torch.linalg.inv(current_c2w.to("cuda"))
+                
+                # Project current 3D positions to 2D
+                selected_means = current_means3d[cam_data['gt_idxs']]
+                current_means_cam = world_to_cam_means(selected_means, current_viewmat[None])
+                means_2d = pers_proj_means(current_means_cam, dataset["K"][None].to("cuda"), 400, 400)
+                current_projections = means_2d.squeeze()
+                
+                # Update 3D trajectories
+                if cam_data['all_trajs'] is None:
+                    cam_data['all_times'] = np.array([t])
+                    cam_data['all_trajs'] = selected_means.unsqueeze(0).cpu().numpy()
+                else:
+                    cam_data['all_times'] = np.concatenate((cam_data['all_times'], np.array([t])), axis=0)
+                    cam_data['all_trajs'] = np.concatenate((cam_data['all_trajs'], selected_means.unsqueeze(0).cpu().numpy()), axis=0)
+                
+                # Create trajectory visualization
+                current_projections_np = current_projections.cpu().numpy()
+                n_gaussians = len(cam_data['gt_idxs'])
+                
+                # Mask for valid projections
+                current_mask = (current_projections_np[:, 0] >= 0) & (current_projections_np[:, 0] < 400) & \
+                              (current_projections_np[:, 1] >= 0) & (current_projections_np[:, 1] < 400)
+                
+                # Draw current points
+                for idx in range(0, n_gaussians, flow_skip):
+                    if current_mask[idx]:
+                        color_idx = (idx // flow_skip) % len(cam_data['colors'])
+                        cv2.circle(current_rendering, 
+                                 (int(current_projections_np[idx, 0]), int(current_projections_np[idx, 1])), 
+                                 2, cam_data['colors'][color_idx], -1)
+                
+                # Draw trajectories if we have multiple frames
+                if cam_data['all_trajs'].shape[0] > 1:
+                    traj_img = np.ascontiguousarray(np.zeros((400, 400, 3), dtype=np.uint8))
+                    
+                    # Apply tracking window
+                    all_trajs = cam_data['all_trajs']
+                    all_times = cam_data['all_times']
+                    if tracking_window is not None and tracking_window < all_trajs.shape[0]:
+                        all_trajs = all_trajs[-tracking_window:]
+                        all_times = all_times[-tracking_window:]
+                    
+                    # Draw trajectory lines
+                    for t_idx in range(all_trajs.shape[0] - 1):
+                        prev_gaussians = torch.from_numpy(all_trajs[t_idx]).to("cuda")
+                        prev_projections_cam = world_to_cam_means(prev_gaussians, current_viewmat[None])
+                        prev_projections = pers_proj_means(prev_projections_cam, dataset["K"][None].to("cuda"), 400, 400)
+                        prev_projections = prev_projections.squeeze()
+                        prev_time = all_times[t_idx]
+                        
+                        curr_gaussians = torch.from_numpy(all_trajs[t_idx + 1]).to("cuda")
+                        curr_projections_cam = world_to_cam_means(curr_gaussians, current_viewmat[None])
+                        curr_projections = pers_proj_means(curr_projections_cam, dataset["K"][None].to("cuda"), 400, 400)
+                        curr_projections = curr_projections.squeeze()
+                        curr_time = all_times[t_idx + 1]
+                        
+                        # Calculate fade factor
+                        time_diff = t - curr_time
+                        max_time_diff = t - all_times[0] if len(all_times) > 1 else 1
+                        
+                        if max_time_diff > 0:
+                            fade_factor = 1.0 - (time_diff / max_time_diff) * fade_strength
+                            fade_factor = max(fade_factor, min_alpha)
+                        else:
+                            fade_factor = 1.0
+                        
+                        # Get masks for valid 2D projections
+                        prev_projections_np = prev_projections.cpu().numpy()
+                        curr_projections_np = curr_projections.cpu().numpy()
+                        
+                        prev_mask = (prev_projections_np[:, 0] >= 0) & (prev_projections_np[:, 0] < 400) & \
+                                   (prev_projections_np[:, 1] >= 0) & (prev_projections_np[:, 1] < 400)
+                        curr_mask = (curr_projections_np[:, 0] >= 0) & (curr_projections_np[:, 0] < 400) & \
+                                   (curr_projections_np[:, 1] >= 0) & (curr_projections_np[:, 1] < 400)
+                        
+                        # Draw trajectory lines
+                        if curr_time <= t and prev_time <= t:
+                            for idx in range(0, curr_projections.shape[0], flow_skip):
+                                color_idx = (idx // flow_skip) % len(cam_data['colors'])
+                                if prev_mask[idx] and curr_mask[idx]:
+                                    faded_color = tuple(int(c * fade_factor) for c in cam_data['colors'][color_idx])
+                                    traj_img = cv2.line(traj_img,
+                                                       (int(prev_projections_np[idx, 0]), int(prev_projections_np[idx, 1])),
+                                                       (int(curr_projections_np[idx, 0]), int(curr_projections_np[idx, 1])),
+                                                       faded_color, arrow_thickness)
+                    
+                    # Overlay trajectories on rendering
+                    current_rendering[traj_img > 0] = traj_img[traj_img > 0]
+                
+                # Save track visualization
+                track_image_path = os.path.join(cam_data['track_path'], f"{t:05d}.png")
+                imageio.imwrite(track_image_path, current_rendering)
+                cam_data['track_imgs'].append(current_rendering)
+    #saving tracks
+    fps = len(render_img_frames)/3
+    if render_tracks and gt_tracks_path and os.path.exists(gt_tracks_path):
+        for cam_idx in cam_indices_lst:
+            cam_data = camera_track_data[cam_idx]
+            if cam_data['track_imgs']:
+                track_video_path = f"{cam_data['track_path']}/full_track.mp4"
+                imageio.mimwrite(track_video_path, cam_data['track_imgs'], fps=fps)
+
+    #saving normal images
+    for j in range(len(dataset["camtoworld"].keys())):
+        outpath = f"{output_folder}/rendered_video_cam_{j}.mp4"
+        imageio.mimwrite(outpath, (render_img_frames[:, j].squeeze()*255).astype(np.uint8), fps=fps)
+
+    #Approach 1: good way
+    opacity_threshold = 0.1
+    viz_pc_t0 = gt_t0_all
+    opacity_t0 = params["opacities"][0]
+    gt_idxs_viz_pc = find_closest_gauss(viz_pc_t0, params["means"][0].cpu().numpy())
+    opacities_idxs_viz_pc = (torch.sigmoid(opacity_t0))[gt_idxs_viz_pc].squeeze().cpu()
+    gt_idxs_viz_pc = gt_idxs_viz_pc[opacities_idxs_viz_pc > opacity_threshold]
+    visible_points = params["means"][:,gt_idxs_viz_pc, :3]
+    torch.save(visible_points, f"{output_folder}/point_cloud_trajectory.pt")
+    min_vals = np.min(visible_points.cpu().numpy(), axis=(0,1))
+    max_vals = np.max(visible_points.cpu().numpy(), axis=(0,1))
+    # center_position= (min_vals + max_vals) /2
+   
+    if "clematis" in data_dir:
+        center_position = [ 0.00516816, -0.04425521, 1.6847012]
+    elif "rose" in data_dir:
+        center_position = [-0.01537376, -0.02297388,  1.6785533]
+    elif "lily" in data_dir:
+        center_position = [-0.01201824, -0.00301804, 1.6874188]
+    elif "tulip" in data_dir:
+        center_position = [0.01245455, 0.00435748, 1.680993] 
+    elif "plant_1" in data_dir:
+        center_position = [-1.24790855e-02, 6.82123005e-04, 1.60255575e+00]
+    elif "plant_2" in data_dir:
+        center_position = [ 2.4079531e-04, -6.9841929e-03,  1.6393759e+00]
+    elif "plant_3" in data_dir:
+        center_position = [-1.5169904e-03, 7.5232387e-03, 1.6430800e+00]
+    elif "plant_4" in data_dir:
+        center_position = [0.01340409, 0.00430154, 1.6087356]
+
+    # elevation, azimuth = 15.732388496398926, -86.39990997314453
+    # global_depth_min, global_depth_max, depth_reference_point = calculate_global_depth_range(visible_points, center_position, view_angles=None, min_vals=min_vals, max_vals=max_vals)
+    #just compute depths once and use it for colors
+    pose_dict = {"r_0": [15.732388496398926, -86.39990997314453],
+                        "r_1": [15.698765754699707, 89.99995422363281], 
+                        "r_2": [15.706961631774902, -82.79780578613281]}
+    for i, pose in enumerate(pose_dict.items()):
+        elevation, azimuth = pose[1]
+        animate_point_clouds(
+            visible_points,
+            figsize=(6, 6),
+            output_file=f"{output_folder}/point_cloud_animation_r_{i}.mp4",
+            is_reverse=False,
+            center_position=center_position,
+            min_vals=min_vals,
+            max_vals=max_vals,
+            view_angles=(elevation, azimuth)
+            # global_depth_min=global_depth_min,
+            # global_depth_max=global_depth_max
+        )
+        #save individual point cloud frames 
+        os.makedirs(f"{output_folder}/point_clouds/r_{i}", exist_ok=True)
+        for j, point in enumerate(visible_points):
+            visualize_point_cloud(
+                point,
+                figsize=(6, 6),
+                output_file=f"{output_folder}/point_clouds/r_{i}/point_cloud_{j}.png",
+                center_position=center_position,
+                min_vals=min_vals,
+                max_vals=max_vals,
+                view_angles=(elevation,azimuth)
+                # global_depth_min=global_depth_min,
+                # global_depth_max=global_depth_max
+            )
+
+            
+
 if __name__ == "__main__":
     """Use this script to render images in a standard format so we can run metrics"""
     parser = ArgumentParser(description="Training script parameters")
@@ -710,12 +1075,19 @@ if __name__ == "__main__":
     parser.add_argument("--exp_path", "-p", default="")
     parser.add_argument("--every_t", "-t", type=int, default=1) #for eval need to match the number of point clouds saved
     parser.add_argument("--split", nargs="+", default=["test"]) #dont render train for now.
+    parser.add_argument("--render_interp", action="store_true")
+    parser.add_argument("--cached_params_path", type=str)
+    parser.add_argument("--render_white", action="store_true")
     args = parser.parse_args()
     data_dir = args.data_dir
     every_t = args.every_t
     exp_path = args.exp_path
-    for split in args.split:
-        print(f"rendering {split}")
-        render_eval(exp_path, data_dir, every_t, split)
+    # for split in args.split:
+    #     print(f"rendering {split}")
+    #     render_eval(exp_path, data_dir, every_t, split)
+    if args.render_interp:
+        render_eval_interp(exp_path, data_dir, every_t, "test", args.cached_params_path, args.render_white)
+    else:
+        render_eval(exp_path, data_dir, every_t, "test")
     print("Done eval")
     torch.cuda.empty_cache()
