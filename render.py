@@ -1015,13 +1015,13 @@ def render_eval_interp(exp_path, data_dir, every_t, split, cached_params_path=No
     # center_position= (min_vals + max_vals) /2
    
     if "clematis" in data_dir:
-        center_position = [ 0.00516816, -0.04425521, 1.6847012]
+        center_position = [0.00250162, -0.0451958,1.6817672]
     elif "rose" in data_dir:
         center_position = [-0.01537376, -0.02297388,  1.6785533]
     elif "lily" in data_dir:
         center_position = [-0.01201824, -0.00301804, 1.6874188]
     elif "tulip" in data_dir:
-        center_position = [0.01245455, 0.00435748, 1.680993] 
+        center_position = [0.0130202 , 0.00563216, 1.6561513] 
     elif "plant_1" in data_dir:
         center_position = [-1.24790855e-02, 6.82123005e-04, 1.60255575e+00]
     elif "plant_2" in data_dir:
@@ -1039,29 +1039,35 @@ def render_eval_interp(exp_path, data_dir, every_t, split, cached_params_path=No
                         "r_2": [15.706961631774902, -82.79780578613281]}
     for i, pose in enumerate(pose_dict.items()):
         elevation, azimuth = pose[1]
+        # colors_clipped = np.clip(colors_np, 0, 3)  # Adjust 3 based on what looks good
+
         animate_point_clouds(
             visible_points,
             figsize=(6, 6),
-            output_file=f"{output_folder}/point_cloud_animation_r_{i}.mp4",
+            output_file=f"{output_folder}/point_cloud_gs_color_animation_r_{i}.mp4",
             is_reverse=False,
             center_position=center_position,
             min_vals=min_vals,
             max_vals=max_vals,
-            view_angles=(elevation, azimuth)
+            view_angles=(elevation, azimuth),
+            use_z_coloring=False,
+            color=torch.clamp(colors[:, gt_idxs_viz_pc], 0, 1).cpu().numpy()
             # global_depth_min=global_depth_min,
             # global_depth_max=global_depth_max
         )
         #save individual point cloud frames 
-        os.makedirs(f"{output_folder}/point_clouds/r_{i}", exist_ok=True)
+        os.makedirs(f"{output_folder}/point_clouds_gs_color/r_{i}", exist_ok=True)
         for j, point in enumerate(visible_points):
             visualize_point_cloud(
                 point,
                 figsize=(6, 6),
-                output_file=f"{output_folder}/point_clouds/r_{i}/point_cloud_{j}.png",
+                output_file=f"{output_folder}/point_clouds_gs_color/r_{i}/point_cloud_{j}.png",
                 center_position=center_position,
                 min_vals=min_vals,
                 max_vals=max_vals,
-                view_angles=(elevation,azimuth)
+                view_angles=(elevation,azimuth),
+                use_z_coloring=False,
+                color=torch.clamp(colors[j, gt_idxs_viz_pc], 0, 1).cpu().numpy()
                 # global_depth_min=global_depth_min,
                 # global_depth_max=global_depth_max
             )

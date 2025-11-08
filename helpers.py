@@ -396,6 +396,11 @@ def animate_point_clouds(
         axis.pane.fill = False
         axis.pane.set_edgecolor('none')
 
+    time_varying_colors = False
+    if isinstance(color, np.ndarray) and color.ndim == 3:
+        time_varying_colors = True
+        colors_array = color  # Shape: (T, N, 3) or (T, N, 4)
+
     # First frame
     first_frame = point_clouds[0]
     x0, y0, z0 = first_frame[:, 0], first_frame[:, 1], first_frame[:, 2]
@@ -439,7 +444,10 @@ def animate_point_clouds(
             scatter = ax.scatter(x0, y0, z0, s=point_size, c=depths, cmap=colormap, alpha=0.8)
 
     else:
-        scatter = ax.scatter(x0, y0, z0, s=point_size, c=color, alpha=0.8)
+        if time_varying_colors:
+            scatter = ax.scatter(x0, y0, z0, s=point_size, c=colors_array[0], alpha=0.8)
+        else:
+            scatter = ax.scatter(x0, y0, z0, s=point_size, c=color, alpha=0.8)
 
     # Axis limits
     ax.set_xlim([-0.12, 0.12])
@@ -482,6 +490,8 @@ def animate_point_clouds(
 
         else:
             scatter._offsets3d = (x, y, z)
+            if time_varying_colors:
+                scatter.set_facecolors(colors_array[frame])
 
         ax.title.set_text(f'Point Cloud Animation - Frame {frame+1}/{T}')
         return scatter,

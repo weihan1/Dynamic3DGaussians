@@ -572,7 +572,7 @@ def train_blender(data_dir, every_t):
     os.makedirs(exp_path, exist_ok=True)
     md = json.load(open(f"{data_dir}/transforms_train.json", 'r'))
     params, variables, images, cam_to_worlds_dict, intrinsics = initialize_params_and_get_data(data_dir, md, every_t)
-    plot_intervals = [1, 599, 1999, 6999, 9999] 
+    plot_intervals = [1, 599, 1999, 6999, 9999, 29_999] 
     strategy = DefaultStrategy(verbose=True)
     strategy.refine_stop_iter = 5000 #original code base only prunes before iteration 5000
     timesteps = list(range(0, len(images["r_1"]))) #assuming all cameras have the same number of timesteps
